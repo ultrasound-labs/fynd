@@ -2,11 +2,25 @@
 
 Record of an investigation into routing algorithms that optimise over the whole pool network
 rather than over a set of pre-enumerated paths. Covers what was surveyed, what was built, what was
-measured, and why it does not work — so the dead ends are not walked twice.
+measured, what turned out to be wrong with it, and what it measures now — so the dead ends are not
+walked twice, and so the two wrong diagnoses on the way here are not reached for a third time.
 
-Status as of 10 October 2026: **the implementation does not work and should not be shipped.** The
-diagnosis is specific and is in [Why it fails](#why-it-fails). The branch is
-`convex-routing`.
+Status as of 10 October 2026, second pass: **the first diagnosis was wrong, four real defects
+were fixed, and the benchmark says the algorithm is still not competitive.** Against the recorded
+Ethereum market it routes 50 of 200 orders where every shipped algorithm routes 193 or more,
+loses to Bellman-Ford on 23 of the 49 orders both answer, and has a p95 latency of 2.6 seconds
+against a 100 ms budget. The numbers are in [Measured results](#measured-results).
+
+The diagnosis changed completely along the way, twice, and both turns are recorded below. The
+method is not wrong for the function ([the first pass's conclusion](#why-it-looked-like-the-method-superseded)),
+the coordinator had four specific defects ([the second pass's](#what-was-actually-wrong)) — and
+fixing all four, which converges synthetic networks of 130 tokens and 257 edges to a net-flow
+residual of 4e-9, moves the recorded market almost not at all: one solve in 39 reaches a usable
+flow. The one finding that does carry across is that
+[`spot_price` is not the derivative of `get_amount_out`](#the-derivative-was-never-the-derivative),
+which was the second of the three reasons the method was chosen.
+
+The branch is `convex-routing`.
 
 ## The question
 
@@ -22,7 +36,7 @@ method that optimises over every pool at once does better.
 | Dual decomposition (Diamandis, Resnick, Chitra, Angeris, FC 2023) | Parallelises over edges; superseded below. |
 | **Convex flow** (Diamandis, Angeris, Edelman, arXiv 2404.00765) | **Chosen.** See below. |
 | Marginal Price Optimization (Loesch, Richardson, arXiv 2502.08258) | Built for many-curves/few-tokens (Bancor's CarbonDeFi); its own paper reports the implementation degrading past a handful of tokens, and it needs a Jacobian. |
-| PRIME / ASGM (Xu, Zhu, Huang, Tang, ICDE 2026) | Keeps the path cap, so it does not answer the question. Its allocation step is still worth stealing for `water_fill`; see [Still worth doing](#still-worth-doing). |
+| PRIME / ASGM (Xu, Zhu, Huang, Tang, ICDE 2026) | Keeps the path cap, so it does not answer the question. Its allocation step is still worth stealing for `water_fill`; see [Still worth doing](#still-worth-doing-independent-of-all-this). |
 | Batch auctions / CoW | Different product; needs a batch window and settlement control. |
 
 Convex flow was chosen for three reasons that all survived scrutiny:
@@ -34,17 +48,19 @@ Convex flow was chosen for three reasons that all survived scrutiny:
    second. Most routers cannot supply the derivative; Tycho can.
 3. **Hyperedges are native**, so multi-token pools are first-class.
 
-None of those three turned out to be wrong. The method still fails.
+The second of those is false, and it took the benchmark to find out:
+[`spot_price` is not that derivative](#the-derivative-was-never-the-derivative). The first and
+third hold. The method still fails.
 
 ## What was built
 
-`fynd-core/src/algorithm/convex_flow/`, registered as the built-in `convex_flow`, roughly 1,500
-lines with 40 tests.
+`fynd-core/src/algorithm/convex_flow/`, registered as the built-in `convex_flow`, roughly 1,600
+lines with 53 tests.
 
 | Module | Contents |
 |---|---|
-| `edge.rs` | The per-edge arbitrage subproblem: no-flow test, bisection on `η₂h⁺(w⋆) ≤ η₁ ≤ η₂h⁻(w⋆)` |
-| `dual.rs` | The reduced dual (one variable per token), gradient, spectral projected gradient coordinator |
+| `edge.rs` | The per-edge arbitrage subproblem: no-flow test, regula falsi on `1/√h⁺` for `η₂h⁺(w⋆) ≤ η₁ ≤ η₂h⁻(w⋆)`, and the check that a flow beats not trading |
+| `dual.rs` | The reduced dual (one variable per token), gradient, spectral projected gradient coordinator, feasibility-first selection of the point it returns |
 | `mod.rs` | Network construction, warm start from `TokenGasPrices`, flow decomposition, `Algorithm` impl |
 | `config.rs` | Tuning constants, each with the reasoning |
 
@@ -54,21 +70,113 @@ coordinator is implemented rather than pulled in.
 
 ## Measured results
 
-Deterministic runs (`--jobs 1`), recorded Ethereum fixture, `aggregator_trades_10k.json`.
+Deterministic runs (`--jobs 1`), recorded Ethereum fixture, `aggregator_trades_10k.json`, 200
+orders, every config at `max_hops = 3` except the `BF_d2` baseline the bench measures against.
+Bps are over the orders a config and the baseline both solved.
 
-| Config | Solved | Mean bps | Median bps | p50 |
-|---|---|---|---|---|
-| `convex_flow` (600 orders) | **149 / 600** | −384.3 | −4.5 | — |
-| `water_fill` (600 orders) | 591 / 600 | +319.1 | +0.0 | — |
-| `convex_flow` (60 orders) | 15 / 60 | −105.7 | +0.0 | 64 ms |
-| `water_fill` (60 orders) | 60 / 60 | +41.8 | +0.0 | 15.6 ms |
-| `bellman_ford` (60 orders) | 58 / 60 | +40.2 | +0.0 | 11.2 ms |
+| config | solved | mean bps | median bps | better | worse | tie | p50 | p95 |
+|---|---|---|---|---|---|---|---|---|
+| `BF_d2` (baseline) | 193/200 | — | — | — | — | — | 0.7ms | 2.0ms |
+| **`CF_d2`** | **50/200** | **−88.5** | +0.0 | **1** | **23** | 25 | 16.9ms | **2.56s** |
+| **`CF_d3`** | **30/200** | **−9.6** | +0.0 | **1** | **3** | 25 | 34.1ms | **0.82s** |
+| `WF_d3` | 198/200 | +147.4 | +0.0 | 69 | 0 | 124 | 9.5ms | 13.2ms |
+| `BF_d3` | 194/200 | +146.8 | +0.0 | 58 | 0 | 135 | 3.7ms | 7.8ms |
+| `ML_d3` | 198/200 | +146.3 | +0.0 | 59 | 0 | 134 | 1.8ms | 3.5ms |
+| `PFW_d3` | 194/200 | +146.8 | +0.0 | 58 | 0 | 135 | 4.5ms | 8.4ms |
 
-Roughly a 25% solve rate, and worse than the baseline where it does solve (82 orders worse against
-1 better, over 600). **61% of the routes it does return are a single leg** — the algorithm whose
-entire purpose is whole-network optimisation mostly returns what Bellman-Ford already gives.
+Three readings, in order of how much they matter.
 
-## Why it fails
+**It does not answer.** A 15 to 25% solve rate against 97 to 99%. Every failure is the same one:
+the coordinator returns a flow that cannot be walked from `token_in` to `token_out`, and
+`decompose` hands back nothing.
+
+**Where it answers it does not win.** One order in fifty, across both configs, beats
+Bellman-Ford. Half the rest are ties — the same route, to the wei, which is the single-leg answer
+Bellman-Ford already had. An algorithm whose purpose is whole-network optimisation is mostly
+reproducing a shortest-path search, which is what the first pass saw as "61% of routes are a
+single leg".
+
+**It does not fit the budget.** A p95 of 0.8 to 2.6 seconds against the 100 ms a quote has, and
+a p50 an order of magnitude above `water_fill`'s. The median solve is fine; the tail is where the
+networks are large, and that is also where whole-network optimisation is supposed to earn its
+keep.
+
+For comparison, the same table before the second pass's fixes: `CF_d2` 26/200 at −251.9 bps,
+`CF_d3` 15/200 at −30.2. The fixes roughly doubled the solve rate and took most of the quality
+gap out, and left the conclusion where it was.
+
+### Why the synthetic fixes barely moved it
+
+Per-solve instrumentation over 60 orders, `CF_d2`, counting what the coordinator actually
+returned:
+
+| | with `spot_price` as the derivative | with a difference quotient |
+|---|---|---|
+| usable flow (residual ≤ 1e-8) | 1/47 | 1/39 |
+| nothing flows (residual = 1.0) | 34/47 | 25/39 |
+| over-trading (residual > 1.0) | 15/47 | 12/39 |
+| simulation budget exhausted | 19/47 | 17/39 |
+| median edges in the network | 27 | 13 |
+
+One solve in forty reaches a feasible point. The rest alternate between idling and saturating,
+which is the same behaviour the first pass recorded as prices diverging — and it survives every
+fix that converges the synthetic networks. Those fixes were not wrong, and the synthetic
+instances were not the problem: whatever the recorded market has that a market of
+`ConstantProductSim` pools does not is still there. The known candidates, in order of suspicion:
+pool depths spread over orders of magnitude within one pair, which is the conditioning the
+Barzilai-Borwein step length has to track; genuine arbitrage gaps between pools of the same pair,
+so the warm start is not a no-arbitrage point; and tick boundaries, where `h⁺` jumps and the
+subproblem's root does not exist, which is a real non-smoothness in the dual where the first
+pass's no-flow kinks were not.
+
+### The derivative was never the derivative
+
+The second of the three reasons convex flow was chosen is false, and it is false for every pool
+in the market.
+
+`ProtocolSim::spot_price` is documented as "the amount of `quote` required to buy exactly 1 unit
+of `base`, **accounting for the protocol fee (i.e. `price = pre_fee_price / (1.0 - fee)`)**". It
+is a buy price marked *up* by the fee. The derivative of `get_amount_out` on the sell side is the
+same pre-fee price marked *down* by it. Thirteen protocol families in tycho-simulation go through
+one `add_fee_markup` helper, so across the market
+
+```text
+spot_price = h⁺(0) / (1 − fee)²
+```
+
+For a 30 bp pool that is 60 bps of error in a quantity whose signal — the price impact of an
+ordinary order against pool depth — is one basis point. Solving `spot_price(w) = η₁/η₂` does not
+find the optimum of anything; it drives every edge to about `fee × reserves` of flow whatever the
+order is worth. That is the over-trading, and it is why the first pass saw routes that were
+clamped junk.
+
+Correcting it by `(1 − fee)²` is not available: `ProtocolSim::fee` is `todo!()` for VM pools and
+panics the worker thread, which is what a benchmark run with the correction did on its first
+Uniswap V4 pool. So the subproblem now takes a difference quotient of `get_amount_out` over a
+step a few thousandths of the trial point — the derivative of the function being optimised,
+measured on that function. It costs a second simulation per trial, and it is worth it: a
+quotient over `[w, w+δ]` is `h⁺(w + δ/2)` to second order, so it displaces the answer by a step
+size this module chooses, where a quoted price displaces it by a fee the market chooses,
+amplified by the pool's depth.
+
+It moved the mean from −141.5 to −53.1 bps on 60 orders and the solve rate not at all. A real
+defect, found by the benchmark, that was not the binding one.
+
+Two notes for anyone reading the subproblem:
+
+- **The secant from zero is not a substitute.** `h(w)/w > η₁/η₂` says the objective is still
+  positive at `w`, not that it is still rising. Its root is at exactly twice the optimum for a
+  constant-product curve, which is what the first attempt at this measured.
+- **A difference quotient needs resolvable amounts.** Outputs are integers, and at toy
+  magnitudes — thousand-unit reserves — one raw unit is a large fraction of the quotient and the
+  slope is noise. The subproblem falls back to the average rate from zero below 64 raw units of
+  output difference, and the tests that need a real derivative were moved to wei magnitudes.
+
+## Why it looked like the method (superseded)
+
+Kept because the measurements are real and the reasoning is where the first pass went wrong. The
+conclusion it reaches is contradicted by [the next section](#what-was-actually-wrong); read them
+together.
 
 Four experiments, each eliminating a candidate.
 
@@ -77,6 +185,11 @@ Four experiments, each eliminating a candidate.
 Raising the iteration cap 10x (552 median iterations) and the simulation budget 100x left the
 net-flow residual at **4.90e+01, identical to three significant figures**, and the active edge
 count at 4. More compute buys nothing.
+
+> This experiment cannot support that reading. `Solution::residual` was the residual of the
+> point with the lowest *dual value*, and the dual value is flat to around 1e-10 over the whole
+> region the iterates visit, so the recorded number is insensitive to extra iterations by
+> construction. The iterates were not stuck; the figure reporting on them could not move.
 
 ### It only works when it is not needed
 
@@ -99,7 +212,8 @@ subproblem were each verified against the source. None of them is wrong.
 
 ### The method is wrong for the function
 
-Correct gradient, correct formulation, and it diverges. The dual is **non-smooth by construction**:
+**This is the conclusion that does not hold.** See the next section. Correct gradient, correct
+formulation, and it diverges. The dual is **non-smooth by construction**:
 each edge contributes a term that is identically zero across its no-flow interval — the pool's
 bid-ask spread — and then kinks. The solver is a spectral projected gradient method, Barzilai-Borwein
 steps with an Armijo line search, which assumes smoothness. A correct *sub*gradient carries no
@@ -136,6 +250,152 @@ lives, and it is the first thing a future attempt should settle:
 > expressible in the underlying convex problem; whether it survives the price parameterisation,
 > and at what cost, is unanswered.
 
+## What was actually wrong
+
+Four defects, in the coordinator and the edge subproblem. Each was found by re-implementing
+`dual.rs` and `edge.rs` as a standalone model — same constants, same integer bisection, same SPG
+loop — and instrumenting it on zero-fee constant-product networks. The failures reproduce there
+with no fees, no decimals, no `get_limits` and no market data, which is what says they are not in
+the market plumbing.
+
+### The returned point was chosen by the wrong quantity
+
+`minimise` kept the flows from the point with the lowest dual value. The dual value is a bound on
+the order's output, so over the region the iterates visit it varies by the slippage the order pays
+— basis points — while the net-flow residual over that same region varies by eight orders of
+magnitude. The route is built from the flows, and flows that do not conserve cannot be walked into
+legs, so selection has to see that difference.
+
+Changing only that comparison, on an 18-token network with the order at a thousandth of pool
+depth: residual **2.80e-01 → 6.38e-07**, input allocated **57% → 100%**, active edges **5 → 8**.
+The iterates were passing through primal-feasible eight-way splits all along and the bookkeeping
+threw them away. Line-search trials are now candidates too — the backtracking is what crosses the
+region where edges first take flow, so that is where the feasible points are.
+
+Selection is feasibility first, then dual value once a point conserves to within the stopping
+tolerance, which is the condition under which the value is the right discriminator.
+
+### The subproblem could not resolve an ordinary leg
+
+Twelve bisection steps over a bracket of `EDGE_VALUE_SLACK` times the order's value put the
+resolution floor at `4/2^12 ≈ 9.8e-04` of the order. Any edge whose optimum was finer reported
+**exactly zero**: measured directly, targets at 1e-1, 1e-2 and 1e-3 of the order resolved, and
+1e-4 — which `MIN_LEG_FRACTION` admits as a leg — came back as an unused edge. The fallback meant
+to catch that case (`!best.is_active() && !low.is_zero()`) was unreachable: `low` only ever
+advanced on the same branch that set `best`.
+
+So the computed gradient was a staircase, and the non-smoothness the first pass attributed to the
+method was manufactured here. Two constants downstream were inconsistent with it: `MIN_LEG_FRACTION`
+at `1e-4` was ten times below what a subproblem could report, and `GAP_TOLERANCE` at `1e-7` four
+orders below, so `stationarity() <= GAP_TOLERANCE` could only fire if quantised flows happened to
+cancel — which is why runs ended on the iteration cap with hundreds of iterations spent after the
+answer was in hand.
+
+The subproblem is now regula falsi on `1/√h⁺`, which is *exactly linear in w* for a
+constant-product curve, so one interpolation lands on the root; a tick curve is that shape
+piecewise and anything monotone still converges, with the Illinois safeguard and the bracket
+underneath. Same step cap, resolution limited by the pool's own arithmetic rather than by the
+bracket. `EDGE_VALUE_SLACK` was then measured again and **kept at 4.0**: the slack cost resolution
+only while the bracket width set it, and narrowing it to the order exactly loses the widest
+instances, which need the room an infeasible intermediate iterate takes.
+
+### A flow that conserves perfectly can be worthless
+
+The fix above surfaced this one. A pool asked for one raw unit pays zero by integer division while
+still quoting a marginal price above the price ratio, so the subproblem would return "takes the
+whole order, pays nothing". That flow conserves at every node, so it is perfectly feasible, and a
+coordinator ranking on conservation prefers it to everything else it will ever see; it also drives
+the dual value below the optimum it is supposed to bound, which is what makes the value untrustworthy
+as a tie-break. `Edge::worth_trading` now drops any flow worth less than not trading —
+`η₂·h(w) > η₁·w`, the subproblem's own objective against its value at zero.
+
+### The step schedule was four to ten orders of magnitude too long
+
+`INITIAL_STEP` was `1.0`, against its own doc comment arguing for a small value. The first trial
+projects `ν_in` to exactly zero while the answer sits within O(amount/depth) — about `1e-4` — of
+the warm start, so iteration one spent ten to fourteen full dual evaluations backtracking, which on
+a 65-edge network is most of the simulation budget before the first accepted step. It is now `1e-6`:
+overshooting is paid for one evaluation at a time by the line search, undershooting is corrected for
+free by the Barzilai-Borwein length from the second iteration on.
+
+Worth keeping in view, though it is now second-order: the warm-start gradient is set by a tuning
+constant, not by the market. Every intermediate token reports exactly `−EDGE_VALUE_SLACK`, because
+each edge draining it proposes its whole cap against one unit of unspent order — measured at
+`−3.999` on every intermediate coordinate of a ten-token network, against a useful signal of `1.0`
+at `token_in`.
+
+### Measured, before and after
+
+Identical synthetic instances, the direct-plus-`k`-two-hop markets from
+`test_solve_scales_with_token_count`, order at a ten-thousandth of pool depth, instrumented in
+place:
+
+| tokens | edges | iterations | simulations | residual |
+|---|---|---|---|---|
+| 3 | 3 | 54 → **16** | 11,148 → **136** | 9.6e-07 → **6.3e-09** |
+| 6 | 9 | 60 → **20** | 12,324 → **169** | 9.6e-07 → **3.6e-11** |
+| 10 | 17 | 56 → **30** | 14,928 → **448** | 7.7e-07 → **5.1e-11** |
+| 18 | 33 | 53 → **36** | 15,060 → **974** | 7.7e-07 → **1.6e-15** |
+| 34 | 65 | 6 → **8** | 11,808 → **1,659** | **1.0e-01** → **7.7e-09** |
+| 66 | 129 | 2 → **9** | 14,820 → **3,486** | **6.4e-02** → **3.7e-10** |
+| 130 | 257 | no route at all | — → **7,326** | — → **3.8e-09** |
+
+Twenty to eighty times fewer simulations, three to seven orders of magnitude less infeasibility,
+and simulation cost now roughly linear in edge count (257 edges, 7,326 solves — about 28 an edge).
+`test_solve_scales_past_thirty_tokens` was `#[ignore]`d as a known limit; it passes and the ignore
+is gone. The sweep stops at 128 middles because `mk_token` runs out of single-byte addresses, not
+because the solve does.
+
+### The fee convention, verified and wrong
+
+The second pass flagged this as an unverified risk and modelled it: on a two-pool instance that
+is exact at zero fee, a 5 bp fee the marginal price does not account for made the solver report
+convergence having allocated 4.98 times the order. The benchmark then confirmed it on the real
+market and the mechanism turned out to be worse than modelled — not a fee missing from the
+marginal, but a fee applied to it in the wrong direction.
+[The derivative was never the derivative](#the-derivative-was-never-the-derivative) has it.
+
+`FeeConstantProductSim` (`algorithm/test_utils.rs`) now covers the fee-bearing case with the
+correct convention, and four `convex_flow` tests use it. It was the right thing to add and it
+could not have found this on its own: a double written to the contract the algorithm needs
+cannot reveal that the market does not meet it.
+
+## Q4, which the first pass left open
+
+Settled, and it is not where the difference lives. The exact-input constraint survives the price
+parameterisation at no cost, and the code already implements it: `U(y) = y_out − I_S(y)` over
+`y_in ≥ −amount` gives `Ū(ν) = ν_in·amount`, finite on `ν ≥ 0`, and exactness falls out of
+complementary slackness — `ν_in > 0` forces `y_in = −amount`. Nothing is lost.
+
+What actually separates this from the paper's §6.2 arbitrage experiment is threefold, and none of it
+is the equality:
+
+- **Where the answer sits.** For arbitrage, prices move O(1) from the start. For a user order the
+  dual optimum is within O(amount/pool depth) of the no-arbitrage warm start, and *below* it:
+  `ν⋆_in = h⁺(amount) ≈ (1 − 2·amount/R)·h⁺(0)` for a constant-product pool. The whole answer lives
+  in a ball of radius ~1e-4 around the starting point, which is why the step schedule mattered as
+  much as it did.
+- **Feasibility is free there.** §6.2 reconstructs `y = Σ Aᵢxᵢ`, so conservation holds by
+  construction and the reported residual measures `y ≥ 0` instead. Here the dual has to deliver
+  conservation itself, which is why the selection rule was the dominant defect.
+- **Their subproblems are unique.** §6.2 adds a strictly concave edge penalty
+  `Vᵢ(xᵢ) = −½‖(xᵢ)₋‖²`. That is the same end `Edge::worth_trading` and the feasibility-first
+  selection reach by other means, and far cheaper than the regularisation the first pass priced at
+  45x the iterations.
+
+Two further corrections to the first pass's reading of the paper:
+
+- **§5.2 does not require what it was read to require.** "If the set `Tᵢ` is strictly convex, then
+  the set `∂fᵢ(ηᵢ⋆)` consists of a single point and `x⋆ᵢ = x̃⋆ᵢ`" — primal feasibility at the dual
+  optimum, with no condition on `U`. The strict concavity of `U` is a condition for the *recovery
+  LP* in the non-strict case, and the non-strict edges are the linear ones (fixed-price pools,
+  limit orders), not constant-product pools.
+- **The dual is not non-smooth at the no-flow boundary.** For a strictly convex trade set `w⋆(η) → 0`
+  continuously as `η₁/η₂ ↑ h⁺(0)`, so `∇fᵢ = x⋆ᵢ → 0`: `fᵢ` is C¹ there, with a jump only in
+  curvature. And the paper's own implementation is off-the-shelf **L-BFGS-B**, a smooth quasi-Newton
+  method, converging linearly on 100 assets and 2,500 markets. Kinks that broke smooth methods would
+  have broken that first.
+
 ## Hypotheses tested and eliminated
 
 Recorded because each cost real time and none should be retried.
@@ -145,29 +405,63 @@ Recorded because each cost real time and none should be retried.
 | Numerical scale (raw 1e18 amounts) | Eliminated — passes 1e3 to 1e24 |
 | Decimal mismatch (18 vs 6) | Real bug, fixed, not the cause — failures are on 18/18 pairs |
 | Simulation budget | Eliminated — 20x budget changes nothing |
-| Bisection resolution | Eliminated — 40 steps changes nothing |
+| Bisection resolution | **Wrongly eliminated.** Raising the step count alone does not help, because the returned point was selected on dual value and that choice is insensitive to resolution. With selection fixed, resolution is one of the four real defects |
 | Both pool directions active at once | Eliminated — fees make them mutually exclusive, measured 0 occurrences |
 | Price degeneracy (identical pools) | Eliminated — distinct prices fail identically |
 | Address ordering | Eliminated |
-| Token count alone | Partly — breaks between 18 and 34 tokens, but as a symptom of kink count |
+| Token count alone | Partly — broke between 18 and 34 tokens, and the cause was cost per evaluation and the selection rule, not kink count. 130 tokens and 257 edges solve now |
 | Gradient error | Eliminated — numerically verified |
-| Larger trades should fare better | **Falsified** — solve rate falls from 32.5% to 17.5% across size quintiles |
+| Larger trades should fare better | **Falsified** — solve rate falls from 32.5% to 17.5% across size quintiles. Consistent with cost, not with divergence: a larger order activates more edges per evaluation, and at twelve bisection steps an evaluation over a few hundred edges was already thousands of simulations |
+| The dual value identifies the best flow | **Falsified, and this was the main defect.** It is flat to ~1e-10 across the region the iterates visit |
+| A conserving flow is a useful flow | **Falsified** — taking the whole order and paying nothing conserves at every node |
+| `spot_price` is the derivative of `get_amount_out` | **Falsified**, and it was one of the three reasons the method was chosen. It is that derivative divided by `(1 − fee)²`, uniformly across the market |
+| Correcting the fee with `ProtocolSim::fee` | Unavailable — `todo!()` for VM pools, panics the worker on the first Uniswap V4 pool |
+| The fee convention is what breaks the real market | Partly — it was real, and worth 88 bps of mean quality, and the solve rate did not move |
+| A bigger simulation budget would help | **Falsified, twice.** The first pass measured no change; the second found the budget acting as an accidental regulariser, so freeing it made quality worse |
+| `MAX_STEP` on a bad secant pair is too long | Eliminated, against expectation. Throwing the step to `1e6` when `sy ≤ 0` looks indefensible next to useful steps of `1e-6` to `1e-2`, and it is the best of five options measured over a 20-instance grid: 18 instances clean, against 17 for a `1e2` ceiling, 17 for `1.0`, 16 for doubling the previous step and 12 for keeping it. A long step with deep backtracking is how the method explores a scale it has no curvature for. Left alone |
 
 Two fixes were real and are kept: the line search could not backtrack far enough
 (`MAX_BACKTRACKS` 12 to 40), and flow decomposition emitted leg fractions summing past one because
 nothing bounded them against the order.
 
-## What a future attempt should do
+## What to do next
 
-1. **Settle Q4 above first.** Does the exact-input constraint survive the price parameterisation,
-   and what does it cost? Everything else is downstream.
-2. **Run `ConvexFlows.jl` against one recorded fixture.** The authors' own Julia implementation
-   exists (`github.com/tjdiamandis/ConvexFlows.jl`, experiment code in its `paper` directory).
-   This separates "the method does not fit" from "our code is wrong" and was never done.
-3. **If continuing, change the solver, not the tuning.** A non-smooth dual wants a bundle method
-   or a proper subgradient scheme with diminishing steps — not a line search. Regularising instead
-   makes the dual smooth but costs the reduced dual and, per the paper's own figures, about 45x the
-   iterations, which does not fit 100 ms.
+The benchmark has run, so the question is no longer "does the implementation work" but "is this
+worth more time". Read in order:
+
+1. **Nothing here is shippable, and the gap is not incremental.** A 15 to 25% solve rate and a
+   2.6 second p95 are not two fixes away from 98% and 13 ms. The three shipped algorithms all
+   sit within a basis point of each other at the median, and `water_fill` beats the baseline on
+   69 of 193 orders; convex flow beats it on 1 of 49.
+2. **If anyone picks it up, start with the idle-or-saturated behaviour**, not with tuning. One
+   solve in forty finds a feasible point on the recorded market while synthetic networks six
+   times larger converge to 4e-9. That gap is the whole remaining question, and the three
+   candidates are listed under
+   [why the synthetic fixes barely moved it](#why-the-synthetic-fixes-barely-moved-it). Pool
+   depths spread over orders of magnitude is the one to measure first, because it is the
+   cheapest to test: take one real pair, keep only the pools within a decade of the deepest, and
+   see whether the solve rate moves.
+3. **The latency tail needs an edge count bound**, and that is awkward: the networks are 281
+   edges at `max_hops = 2` on a busy pair, each needing roughly 0.8 simulations per coordinator
+   iteration, and bounding the edge set is the path cap the method exists to avoid. A bound by
+   dominance — drop a pool that is both worse priced and shallower than another on the same pair
+   — would be legitimate and is unexplored.
+4. **Gas is still not in the objective.** `MAX_LEGS` stands in for the fixed-cost term of
+   arXiv 2408.12761. Any serious attempt needs it, since the routes this returns are mostly
+   single-leg anyway and the ones that are not have to pay for their legs.
+5. **`ConvexFlows.jl` against one recorded fixture** remains the clean separator between "the
+   method does not fit" and "our code is wrong". It is now worth less than it was: the code has
+   been shown to converge on synthetic networks at scale, so the question it would answer is
+   narrower — whether the authors' implementation finds feasible points on *this* market.
+
+Three things not to do, each because it has been tried and measured. Q4 is
+[settled](#q4-which-the-first-pass-left-open) and was never the problem. A bundle or subgradient
+method does not follow from the dual being non-smooth at the no-flow boundary, because it is not.
+And raising the simulation budget does not help, for a reason that took the benchmark to see: it
+is currently acting as an accidental regulariser. Making the unpriced-input branch of the
+subproblem cheap — one simulation instead of twenty-four for the same answer — raised the solve
+rate by half and tripled the orders lost, because the budget it freed was spent on further
+excursions to a zero price.
 
 ## Still worth doing, independent of all this
 
@@ -191,12 +485,45 @@ but it is a cheap, contained improvement to the algorithm that actually wins tod
 - **The synthetic harness and the real market can disagree.** Flooring prices away from zero fixed
   the 66-token synthetic case outright and halved the real-market solve rate. A synthetic fix is
   not a fix until the benchmark agrees.
+- **A zero-fee double cannot find a fee bug.** Every pool in the harness was `ConstantProductSim`,
+  which charges nothing, and the subproblem's whole correctness rests on a fee-consistency property
+  between two pool methods. The harness could not have failed on it. `FeeConstantProductSim` exists
+  now; the lesson generalises to any property of the double that is load-bearing for the algorithm.
+- **Instrument the metric before trusting the experiment.** "It is stuck, not slow" was measured
+  with `Solution::residual`, which reported the residual of the lowest-dual-value point — a figure
+  that cannot respond to more iterations when the dual value is flat. The experiment was sound and
+  the instrument was not, and four of the eliminated hypotheses were eliminated through it.
+- **Synthetic convergence is not evidence about the market.** Four defects were found and fixed
+  against a standalone model and a synthetic harness, taking networks of 130 tokens and 257 edges
+  from no answer to a residual of 4e-9, and the recorded market moved from 26 solves in 200 to
+  50, still losing. The harness and the model agreed with each other and both were measuring a
+  market made of one pool type with one fee convention and depths within a decade of each other.
+  The benchmark was the only thing that could have found the convention error, and it was
+  available the whole time.
+- **Run the cheap end-to-end measurement first.** The order that actually happened — model, fix,
+  synthetic test, benchmark — spent most of its effort before the measurement that reframed the
+  problem. A 20-order benchmark run takes a minute and would have shown the 1-in-20 solve rate
+  and the 1.5 second p95 on the first day.
+- **The model is not the solver, in both directions.** It reproduced the real failures faithfully
+  enough to localise four defects, and it also reports a stall the Rust code does not have: 34
+  tokens and 65 edges against an order a millionth of pool depth cycles between zero flow and
+  over-trading two edges, where `test_solve_small_order_against_many_edges` clears its floor on
+  the same shape. Differences in `warm_start`'s reference propagation and the single-leg fallback
+  in `find_best_route` are enough to account for it. A model finding is a lead, not a result.
+- **Re-implementing the solver as a throwaway model paid for itself.** A faithful model of
+  `dual.rs` and `edge.rs` — same constants, same integer bisection, same loop — reproduced the
+  reported residuals and price divergence on zero-fee networks with no market data at all, which
+  is what localised the defects to the coordinator. It also made each candidate fix a one-line
+  experiment across an instance grid, where the Rust path costs a rebuild per attempt. The two
+  disagreed once, on `EDGE_VALUE_SLACK`, and the rule from the note above applied: the model
+  proposed narrowing it, the instance grid said it loses the widest networks, and it was kept.
 
 ## Reproducing
 
 ```bash
-# the recorded market fixture lives in Git LFS, under the upstream remote
-git lfs install && git lfs fetch upstream && git lfs checkout
+# the recorded market fixture lives in Git LFS; `git lfs pull` is enough on a clone of this
+# remote, and the file is ~4.9 MB when it is really there rather than a 132-byte pointer
+brew install git-lfs && git lfs install --local && git lfs pull
 
 # the trade dataset is a GitHub release asset
 curl -sL -o aggregator_trades_10k.json \
@@ -208,8 +535,14 @@ cargo test -p fynd-core --all-features --lib convex_flow
 printf 'algorithm = "convex_flow"\nmax_hops = 2\n' > bench-harness/configs/CF_d2.toml
 printf 'algorithm = "convex_flow"\nmax_hops = 3\n' > bench-harness/configs/CF_d3.toml
 
-./scripts/bench.sh --name cf --orders 600 --jobs 1 \
-  --trades aggregator_trades_10k.json --configs CF_d2,WF_d3,BF_d3
+# the comparison in Measured results, about twelve minutes at --jobs 1
+./scripts/bench.sh --name cf --orders 200 --jobs 1 --trades aggregator_trades_10k.json \
+  --configs CF_d2,CF_d3,WF_d3,BF_d3,ML_d3,PFW_d3
+
+# per-solve residuals, edge counts and simulation counts, which is where the diagnosis is
+RUST_LOG="fynd_core::algorithm::convex_flow=debug" ./scripts/bench.sh --name dbg --orders 60 \
+  --jobs 1 --logs --trades aggregator_trades_10k.json --configs CF_d2 2>&1 |
+  grep "convex flow solved"
 ```
 
 ## References
