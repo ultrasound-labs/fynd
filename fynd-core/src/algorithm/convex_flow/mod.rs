@@ -264,16 +264,36 @@ fn to_raw_marginal(human: f64, decimals_in: u32, decimals_out: u32) -> f64 {
     human * 10f64.powi(decimals_out as i32 - decimals_in as i32)
 }
 
-/// The edge's marginal price at zero trade, in raw output units per raw input unit, and the
-/// largest input the pool accepts. `None` when either is unavailable and the edge cannot take
-/// part.
+/// The edge's marginal price at zero trade, net of the pool's fee, in raw output units per raw
+/// input unit — and the largest input the pool accepts. `None` when either is unavailable and
+/// the edge cannot take part.
 ///
-/// The graph caches a fee-inclusive spot price on each edge, but only once a derived-data pass
-/// has run — `EdgeData::data` is documented as "None if not yet computed", and it is empty on a
-/// worker's first solves and for any pair the derived pass has not reached. Treating the cache as
-/// required would idle the whole network in exactly those cases, so a miss falls back to reading
-/// the price off the pool. That costs no `get_amount_out`: `spot_price` on the current state is
-/// the marginal price at zero trade by definition.
+/// # Why not just `spot_price`
+///
+/// Because it is not the marginal price. `ProtocolSim::spot_price` is contractually
+/// "the amount of `quote` required to buy exactly 1 unit of `base`, accounting for the protocol
+/// fee (i.e. `price = pre_fee_price / (1.0 - fee)`)" — a buy price marked *up* by the fee, where
+/// a sell through this edge is paid the pre-fee price marked *down* by it. Thirteen protocol
+/// families in tycho-simulation route it through one `add_fee_markup` helper, so for those the
+/// quoted price is `h⁺(0) / (1 − fee)²`, and others quote it net already. Correcting it with
+/// `ProtocolSim::fee` is not possible: that method is `todo!()` for VM pools and panics the
+/// worker.
+///
+/// So the fee-net price is taken the way `ComponentDepthComputation::net_marginal_price` takes
+/// it, which is the same convention tycho's `PoolTargetPrice` compares against:
+///
+/// ```text
+/// h⁺(0) = min( spot(in → out), 1 / spot(out → in) )
+/// ```
+///
+/// A protocol that marks the price up quotes `p/(1−φ)` forward and `1/(p(1−φ))` backward, so the
+/// minimum is `p(1−φ)`, the fee-net price. One that quotes net already gives the same number
+/// twice. Either way the minimum is right, and it needs no knowledge of which convention the
+/// pool follows.
+///
+/// The reverse spot price is read from the pool rather than from the graph, whose edge weight
+/// carries only this direction. Both are cheap — `spot_price` is reserve arithmetic for
+/// everything but a VM pool — and this runs once per edge per solve, not per iteration.
 fn edge_bounds(
     market: &MarketDataView<'_>,
     edge_data: &EdgeData<DepthAndPrice>,
@@ -281,17 +301,22 @@ fn edge_bounds(
     token_out: &Token,
 ) -> Option<(f64, BigUint)> {
     let sim = market.get_simulation_state(&edge_data.component_id)?;
-    let human = match edge_data.data.as_ref() {
+    let forward = match edge_data.data.as_ref() {
         Some(weight) => weight.spot_price,
         None => sim
             .spot_price(token_in, token_out)
             .ok()?,
     };
+    let net = match sim.spot_price(token_out, token_in) {
+        Ok(reverse) if reverse.is_finite() && reverse > 0.0 => forward.min(1.0 / reverse),
+        // Without a reverse price the forward one is all there is, as in `net_marginal_price`.
+        _ => forward,
+    };
     // `spot_price` is decimal-adjusted — a rate between human units — while every amount here
     // and every derived token price is in raw units. Comparing the two directly is wrong by
     // `10^(dec_out - dec_in)`, which for WETH into USDC is a factor of a trillion, so this
     // conversion is not a refinement but the thing that makes the no-flow test mean anything.
-    let marginal_at_zero = to_raw_marginal(human, token_in.decimals, token_out.decimals);
+    let marginal_at_zero = to_raw_marginal(net, token_in.decimals, token_out.decimals);
     if !(marginal_at_zero.is_finite() && marginal_at_zero > 0.0) {
         return None;
     }

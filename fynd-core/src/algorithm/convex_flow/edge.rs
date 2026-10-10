@@ -14,62 +14,46 @@
 //! η₂·h⁺(w⋆) ≤ η₁ ≤ η₂·h⁻(w⋆)
 //! ```
 //!
-//! where `h⁺` and `h⁻` are the right and left derivatives. The derivatives are not assumed to
-//! agree: a tick AMM is piecewise and need not be differentiable where the optimum lands.
+//! which says in words: *trade until the pool's marginal price has fallen to the price ratio the
+//! coordinator is offering*.
 //!
-//! # Where the derivative comes from
+//! # The pool answers this directly
 //!
-//! Not from `ProtocolSim::spot_price`. That is tempting — it is one cheap call and the graph
-//! already caches it — and it is the wrong quantity. Its contract is "the amount of `quote`
-//! required to buy exactly 1 unit of `base`, accounting for the protocol fee (i.e.
-//! `price = pre_fee_price / (1.0 - fee)`)": a *buy* price marked **up** by the fee, where the
-//! derivative of `get_amount_out` on the sell side is the pre-fee price marked **down** by it.
-//! Thirteen protocol families in tycho-simulation implement it through the same
-//! `add_fee_markup` helper, so across the market
+//! That sentence is the contract of [`SwapConstraint::PoolTargetPrice`] — "the swap required to
+//! move the pool's marginal price down to a target" — so this module asks for it rather than
+//! searching for it. Around twenty protocols implement `query_pool_swap`; Uniswap V2 inverts its
+//! own reserve formula, Uniswap V3 and V4 use the pool's native `sqrt_price_limit` swap, and
+//! anything without a closed form falls back to tycho's generic search. The cost is one call for
+//! an analytic pool and up to thirty `get_amount_out` calls for the rest, which the returned
+//! `price_points` reports so the caller can bill it.
 //!
-//! ```text
-//! spot_price = h⁺(0) / (1 − fee)²
-//! ```
+//! Three things come with the oracle that a search over `get_amount_out` cannot have:
 //!
-//! For a 30 bp pool that is 60 bps of error in a quantity whose useful signal — the price impact
-//! of an ordinary order against pool depth — is one basis point. Solving `spot_price(w) = η₁/η₂`
-//! drives every edge to about `fee × reserves` of flow whatever the order is worth, which is the
-//! over-trading the recorded market showed. Correcting it with `(1 − fee)²` is not available
-//! either: `ProtocolSim::fee` is `todo!()` for VM pools and panics the worker.
+//! - **The protocol's own definition of marginal price**, so the fee is handled by the protocol
+//!   that charges it. `ProtocolSim::spot_price` is not that quantity — it is contractually
+//!   `pre_fee_price / (1 - fee)`, a buy price marked *up* by the fee, where this subproblem needs
+//!   the derivative of `get_amount_out`, which is the same price marked *down* by it. Searching on
+//!   `spot_price` solves for a root that is wrong by `1/(1 − fee)²`, and for an order whose price
+//!   impact is a basis point against a thirty basis point pool that is not a correction, it is the
+//!   whole answer.
+//! - **Exactness where the curve is discrete.** A tick pool's marginal price steps, so there is
+//!   often no trade that lands on the target; the protocol's own implementation knows which side of
+//!   the tick to stop on, and a numerical search over amounts does not.
+//! - **One call instead of a bracket.** The search this replaced spent two simulations per trial
+//!   point building a difference quotient, because no usable derivative was available.
 //!
-//! So the subproblem reads the derivative off the gain function it is actually optimising: a
-//! difference quotient of `get_amount_out` over a step a few thousandths of the trial point.
-//! That costs a second simulation per trial and is worth it twice over — it is the real curve,
-//! and it is local. The secant from zero is not a substitute: `h(w)/w > η₁/η₂` says the
-//! objective is still *positive* at `w`, not that it is still *rising*, and for a
-//! constant-product curve its root sits at exactly twice the optimum.
-//!
-//! A difference quotient over `[w, w+δ]` is `h⁺(w + δ/2)` to second order, so using it as
-//! `h⁺(w)` displaces the answer by `δ/2` and nothing worse. That is the whole reason to prefer
-//! it to a quoted price: the error it admits is a step size this module chooses, where the
-//! error a quoted price admits is a fee the market chooses, amplified by the pool's depth.
-//!
-//! Three things make this affordable against a worker's simulation budget. The **no-flow test**
-//! rejects an edge using only its marginal price at zero trade — the spot price the graph
-//! already carries — so an edge the optimum does not use mostly costs nothing; the fee markup
-//! above makes that test admit a few edges it should not, which is the safe direction, since it
-//! spends simulations rather than losing routes. Edges that survive it are bracketed by
-//! `get_limits` before any step, so no simulation is spent discovering the search interval. And
-//! the root inside that bracket is found by **regula falsi on `1/√`**, which for a
-//! constant-product curve is linear in `w` and so lands on the answer in one or two simulations
-//! where bisection needs twelve.
-//!
-//! Resolution matters as much as cost. A bracket is the whole order's worth of the input token,
-//! and an edge carrying one part in ten thousand of a split is an ordinary leg, so a subproblem
-//! that resolves flow to a fixed fraction of its bracket reports zero for legs the route needs.
-//! Interpolation resolves a smooth curve to machine precision within the step cap; the cap is
-//! there for curves it cannot predict.
+//! The no-flow test stays, and still costs nothing: an edge whose marginal price at zero trade is
+//! already below the price ratio wants no flow, and the cached price answers that without a call.
 
 use num_bigint::BigUint;
-use num_traits::{One, ToPrimitive, Zero};
-use tycho_simulation::tycho_common::models::token::Token;
+use num_traits::{Float, One, ToPrimitive, Zero};
+use tycho_simulation::{
+    evm::query_pool_swap::query_pool_swap,
+    tycho_common::{models::token::Token, simulation::errors::SimulationError},
+    tycho_core::simulation::protocol_sim::{Price, QueryPoolSwapParams, SwapConstraint},
+};
 
-use super::config::{EDGE_REL_TOLERANCE, MAX_EDGE_ITERATIONS};
+use super::config::TARGET_PRICE_TOLERANCE;
 use crate::{
     algorithm::{sim_meter, sim_meter::MeteredProtocolSim, AlgorithmError},
     feed::market_data::MarketState,
@@ -79,27 +63,17 @@ use crate::{
 /// The stage every swap this module makes is booked under.
 const EDGE_SUBPROBLEM_STAGE: sim_meter::StageLabel = "convex_flow_edge";
 
-/// Denominator the interpolated bracket fraction is expressed in, so the trial point is computed
-/// in integer arithmetic and a bracket too wide for `f64` cannot overflow it.
-const FRACTION_SCALE: u64 = 1_000_000_000;
-
-/// The difference quotient's step, as a fraction of the point it is taken at.
-const DERIVATIVE_STEP_DIVISOR: u64 = 4096;
-
-/// How many raw output units the difference quotient must span to be worth believing.
+/// What one `query_pool_swap` is billed as when it reports no search history.
 ///
-/// Outputs are integers, so a quotient whose numerator is a handful of units carries a rounding
-/// error of a sizeable fraction of itself, and a slope wrong by tens of percent idles an edge
-/// that should carry flow. Below this the subproblem falls back on the average rate from zero.
-/// Any real order is orders of magnitude clear of it: a leg paying 64 raw units of an 18-decimal
-/// token is 6.4e-17 of one token.
-const MIN_RESOLVED_OUTPUT_UNITS: f64 = 64.0;
+/// A pool that answers analytically runs no simulation at all, but it is not free either, so it
+/// is charged the same as one swap rather than nothing.
+const ANALYTIC_QUERY_COST: usize = 1;
 
 /// One directed edge of the flow network: a pool, traded one way.
 ///
 /// Both directions of a pool are separate edges, each with flow `w ≥ 0`. Modelling it this way
 /// means only the `h⁺(0)` side of the no-flow interval is ever tested — the `h⁻(0)` side is the
-/// reverse edge's own test — and the search never has to consider negative flow.
+/// reverse edge's own test — and the subproblem never has to consider negative flow.
 #[derive(Clone)]
 pub(crate) struct Edge {
     /// The pool this edge trades through.
@@ -112,14 +86,15 @@ pub(crate) struct Edge {
     pub node_in: usize,
     /// Index of `token_out` in the solver's price vector.
     pub node_out: usize,
-    /// The pool's quoted spot price, token_out per token_in, at zero trade.
+    /// `h⁺(0)`: the marginal price net of the pool's fee, raw token_out per raw token_in, at zero
+    /// trade.
     ///
-    /// Taken from the graph's edge weight, which the derived-data pass refreshes every block, so
-    /// reading it costs no simulation. It is an *upper bound* on `h⁺(0)` and not `h⁺(0)` itself —
-    /// `spot_price = h⁺(0) / (1 − fee)²`, see the module docs — so it filters edges and guides
-    /// interpolation, and never decides how much an edge carries.
+    /// Net of the fee is the whole point, and is why this is not a plain `spot_price`: see
+    /// `edge_bounds` in the parent module for how it is derived, and the module docs for what
+    /// goes wrong when it is not.
     pub marginal_at_zero: f64,
-    /// Largest input the pool accepts for this pair, from `get_limits`.
+    /// Largest input the pool accepts for this pair, from `get_limits`, capped to the order's own
+    /// value by `cap_edges_to_order_value`.
     pub max_in: BigUint,
 }
 
@@ -131,6 +106,11 @@ pub(crate) struct EdgeFlow {
     /// Output it pays.
     pub amount_out: BigUint,
     /// Gas the swap costs, zero when the edge carries nothing.
+    ///
+    /// Zero also when the flow came from the price oracle, which reports no gas. Nothing
+    /// downstream reads it: `decompose` copies it into a `SimulatedHop`, and `build_split_route`
+    /// re-executes every hop and takes the gas from that, which is the figure the route carries
+    /// and the router ranks on.
     pub gas: BigUint,
 }
 
@@ -146,24 +126,16 @@ impl EdgeFlow {
     }
 }
 
-/// Which end of the bracket the last accepted step moved.
-///
-/// Regula falsi keeps one endpoint for many steps when the curve is not the shape the transform
-/// assumes, and then converges linearly from one side. The Illinois safeguard halves the stale
-/// endpoint's residual once it has been kept twice, which pulls the next interpolation across.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Stale {
-    Neither,
-    Low,
-    High,
-}
-
 impl Edge {
-    /// Whether the optimum leaves this edge unused, decided without simulating.
+    /// Whether the optimum leaves this edge unused, decided without a call.
     ///
     /// Flow is worth starting only while the output is worth more than the input it consumes,
     /// i.e. while `η₂·h⁺(0) > η₁`. Written as a price ratio that is the paper's no-flow
     /// condition for the forward direction: the edge sits idle whenever `η₁/η₂ ≥ h⁺(0)`.
+    ///
+    /// Exact, now that `marginal_at_zero` is the fee-net marginal price rather than a quoted
+    /// one. On a quoted price this test admitted edges that could not pay, and the subproblem had
+    /// to spend simulations discovering it.
     ///
     /// A non-positive output price would make the comparison meaningless, so the edge is treated
     /// as idle; the coordinator keeps prices non-negative and the output token's price pinned at
@@ -177,22 +149,14 @@ impl Edge {
 
     /// Solves this edge's subproblem at the given prices.
     ///
-    /// Returns the flow the edge wants to carry, and how many simulations it took. A caller
-    /// tracking a budget adds the count; an edge rejected by [`Self::carries_no_flow`] costs
-    /// nothing and never reaches here.
-    ///
-    /// The search keeps a bracket whose low end is the largest input whose increment paid for
-    /// itself and whose high end is the smallest that did not, both evaluated, starting from
-    /// `(0, 0)` and the pool's own limit. Each step tests one trial point by the secant from the
-    /// low end: `η₂·(h(trial) − h(low)) > η₁·(trial − low)`. Accepting on that test means every
-    /// returned flow has a strictly higher subproblem objective than the point before it, and
-    /// the first point is zero flow, so what comes back is always worth trading.
+    /// Returns the flow the edge wants to carry, and what the call cost in simulations. An edge
+    /// rejected by [`Self::carries_no_flow`] costs nothing and never reaches here.
     ///
     /// # Errors
     ///
-    /// Returns [`AlgorithmError::SimulationFailed`] when the pool cannot price a trade it
-    /// admitted through `get_limits`, and [`AlgorithmError::DataNotFound`] when the component
-    /// has left the market since the edge was built.
+    /// Returns [`AlgorithmError::SimulationFailed`] when the pool cannot price a swap to the
+    /// target, and [`AlgorithmError::DataNotFound`] when the component has left the market since
+    /// the edge was built.
     pub fn solve(
         &self,
         price_in: f64,
@@ -203,136 +167,80 @@ impl Edge {
             return Ok((EdgeFlow::none(), 0));
         }
         let target_marginal = price_in / price_out;
+
         // An input the coordinator has priced at zero, or not priced at all. The subproblem is
         // unbounded there — free input, concave output — so what answers it is the
-        // `EDGE_VALUE_SLACK` cap, a tuning constant rather than anything about the market.
-        //
-        // That is worth stating plainly, because the cap is doing more work than the dual is.
-        // Every toy solve in this module's tests reaches its answer through this branch: the
-        // coordinator drives the input price to zero, the edge offers its whole cap, and
-        // `decompose` clamps that back to the order — which on a single-pool market is exactly
-        // "send everything" and is why those tests pass. Returning no flow here instead, which
-        // is the defensible reading of an unbounded subproblem, fails five of them.
-        //
-        // It is also why the real market is not helped by making this branch cheap. Walking to
-        // the cap through the search costs twenty-four simulations and reaching it directly
-        // costs one, and on the recorded market that saving raises the solve rate by half while
-        // tripling the orders it loses on, because the budget it frees is spent on further
-        // excursions to a zero price. The sim budget was acting as an accidental regulariser.
-        if target_marginal <= 0.0 || target_marginal.is_nan() {
+        // `EDGE_VALUE_SLACK` cap, a tuning constant rather than anything about the market. It is
+        // also not a price the oracle can be asked about.
+        let Some(target) = raw_price(target_marginal) else {
             return self.at_limit(price_in, price_out, market);
-        }
-
-        // The bracket is known before any simulation: zero is always feasible and the pool's
-        // own limit bounds the other end.
-        let mut low = BigUint::zero();
-        let mut high = self.max_in.clone();
-        let (high_flow, high_marginal, mut sims) = self.marginal_at(&high, market)?;
-
-        if high_marginal > target_marginal {
-            // The whole bracket is still worth feeding, so the limit is the optimum. A deep pool
-            // against a small order lands here, and the bracket is the order's own value, so
-            // this is the cap binding rather than the pool saturating.
-            return Ok((self.worth_trading(high_flow, price_in, price_out), sims));
-        }
-
-        // `marginal_at_zero` bounds `h⁺(0)` from above, so it is a usable guide for the first
-        // interpolation even though it is not the derivative.
-        let mut low_residual = residual(self.marginal_at_zero, target_marginal);
-        let mut high_residual = residual(high_marginal, target_marginal);
-        let mut best: Option<EdgeFlow> = None;
-        let mut stale = Stale::Neither;
-
-        let tolerance = self.bracket_tolerance();
-        for _ in 0..MAX_EDGE_ITERATIONS {
-            if &high - &low <= tolerance {
-                break;
-            }
-            let trial = interpolate(&low, &high, low_residual, high_residual);
-            let (flow, marginal, spent) = self.marginal_at(&trial, market)?;
-            sims += spent;
-
-            // `h⁺` is non-increasing in `w` because `h` is concave: while the marginal at the
-            // trial still beats the price ratio, every unit up to it was worth taking, so the
-            // optimum is at or above it.
-            if marginal > target_marginal {
-                low = trial;
-                low_residual = residual(marginal, target_marginal);
-                best = Some(flow);
-                if stale == Stale::Low {
-                    high_residual = high_residual.map(|r| r * 0.5);
-                }
-                stale = Stale::Low;
-            } else {
-                high = trial;
-                high_residual = residual(marginal, target_marginal);
-                if stale == Stale::High {
-                    low_residual = low_residual.map(|r| r * 0.5);
-                }
-                stale = Stale::High;
-            }
-        }
-        match best {
-            Some(flow) => Ok((self.worth_trading(flow, price_in, price_out), sims)),
-            None => Ok((EdgeFlow::none(), sims)),
-        }
-    }
-
-    /// The flow at `amount_in` and the curve's slope there, with the simulations it cost.
-    ///
-    /// The slope is a difference quotient of `get_amount_out` over `DERIVATIVE_STEP_DIVISOR` of
-    /// the point, taken forward where the pool's limit allows it and backward at the limit
-    /// itself. Two simulations, and the second one is what makes the quantity the derivative of
-    /// the function being optimised rather than a price quoted alongside it.
-    fn marginal_at(
-        &self,
-        amount_in: &BigUint,
-        market: &MarketState,
-    ) -> Result<(EdgeFlow, f64, usize), AlgorithmError> {
-        let (flow, out) = self.evaluate(amount_in, market)?;
-        let step = self.derivative_step(amount_in);
-        let forward = amount_in + &step;
-
-        let (probe, backward) =
-            if forward <= self.max_in { (forward, false) } else { (amount_in - &step, true) };
-        let (_, probe_out_value) = self.evaluate(&probe, market)?;
-        let span = step
-            .to_f64()
-            .filter(|s| s.is_finite() && *s > 0.0)
-            .ok_or_else(|| AlgorithmError::Other("derivative step does not fit a float".into()))?;
-        let difference = match backward {
-            false => probe_out_value - out,
-            true => out - probe_out_value,
         };
 
-        // A pool whose output barely moves across the step cannot be differentiated here: its
-        // integer rounding is a large fraction of the difference. That is a property of the
-        // amounts rather than of the pool, and no real order is near it, so rather than trust a
-        // slope that is tens of percent wrong — which idles an edge that should carry flow —
-        // fall back on the average rate from zero. By concavity that is an upper bound on the
-        // slope, so a market too coarse to measure gets over-trading instead of abandonment, and
-        // `Self::worth_trading` still holds the result to paying for itself.
-        let marginal = if difference.abs() < MIN_RESOLVED_OUTPUT_UNITS {
-            let amount = amount_in
-                .to_f64()
-                .filter(|a| a.is_finite() && *a > 0.0);
-            match amount {
-                Some(amount) => out / amount,
-                None => 0.0,
-            }
-        } else {
-            difference / span
-        };
-        Ok((flow, marginal, 2))
-    }
+        let sim = market
+            .get_simulation_state(&self.component_id)
+            .ok_or_else(|| AlgorithmError::DataNotFound {
+                kind: "simulation state",
+                id: Some(self.component_id.clone()),
+            })?;
+        let params = QueryPoolSwapParams::new(
+            self.token_in.clone(),
+            self.token_out.clone(),
+            SwapConstraint::PoolTargetPrice {
+                target,
+                tolerance: TARGET_PRICE_TOLERANCE,
+                min_amount_in: None,
+                max_amount_in: Some(self.max_in.clone()),
+            },
+        );
 
-    /// How far apart the two points of the difference quotient sit.
-    ///
-    /// A few thousandths of the trial point, floored at one raw unit since amounts are integers.
-    /// Small enough that displacing the answer by half of it does not matter, large enough that
-    /// the output difference is not lost to the pool's own integer rounding.
-    fn derivative_step(&self, amount_in: &BigUint) -> BigUint {
-        (amount_in / BigUint::from(DERIVATIVE_STEP_DIVISOR)).max(BigUint::one())
+        // The generic search is tycho's own fallback for a pool with no closed form, and it is
+        // reached the same way `ComponentDepthComputation` reaches it: by the error the default
+        // trait method returns.
+        let queried = match sim.query_pool_swap(&params) {
+            Err(SimulationError::FatalError(message))
+                if message == "query_pool_swap not implemented" =>
+            {
+                query_pool_swap(sim, &params)
+            }
+            result => result,
+        };
+
+        // Two things send this to the cap, and they are the same answer.
+        //
+        // The query can refuse the target as unreachable, which its contract says means the
+        // target is above the pool's spot price or below what the pool's limit can reach. The
+        // first cannot happen here — `carries_no_flow` already compared the target against the
+        // fee-net marginal, which is at or below the quoted spot the query tests — so an
+        // unreachable target means the optimum is past the bracket.
+        //
+        // Or the query can answer past the cap, because a protocol with a closed form ignores
+        // `max_amount_in` and swaps to the price it was asked for: Uniswap V3 and V4 take the
+        // target and nothing else. Honouring the cap is this module's job either way, since it
+        // is what keeps an infeasible intermediate iterate finite.
+        //
+        // `at_limit` re-simulates at the cap, so a pool that is genuinely broken rather than
+        // saturated still returns its error from there.
+        let swap = match queried {
+            Ok(swap) if swap.amount_in() <= &self.max_in => swap,
+            _ => {
+                let (flow, spent) = self.at_limit(price_in, price_out, market)?;
+                return Ok((flow, spent + ANALYTIC_QUERY_COST));
+            }
+        };
+
+        // What the answer cost. An analytic pool reports no search history; the generic search
+        // reports one price point per probe it made, which is one `get_amount_out` each.
+        let sims = swap
+            .price_points()
+            .as_ref()
+            .map_or(ANALYTIC_QUERY_COST, |points| points.len().max(ANALYTIC_QUERY_COST));
+
+        let flow = EdgeFlow {
+            amount_in: swap.amount_in().clone(),
+            amount_out: swap.amount_out().clone(),
+            gas: BigUint::zero(),
+        };
+        Ok((self.worth_trading(flow, price_in, price_out), sims))
     }
 
     /// The flow at the pool's own limit, for the degenerate case of an unpriced input.
@@ -342,16 +250,17 @@ impl Edge {
         price_out: f64,
         market: &MarketState,
     ) -> Result<(EdgeFlow, usize), AlgorithmError> {
-        let (flow, _) = self.evaluate(&self.max_in, market)?;
+        let flow = self.evaluate(&self.max_in, market)?;
         Ok((self.worth_trading(flow, price_in, price_out), 1))
     }
 
     /// Drops a flow worth less at these prices than not trading at all.
     ///
     /// The subproblem maximises `η₂·h(w) − η₁·w`, which is zero at zero flow, so a flow is only
-    /// its solution while that stays positive. The search above accepts only steps that raise
-    /// it, so this is the backstop for the two paths that do not go through a step: the
-    /// bracket-wide secant, and the free-input case in [`Self::at_limit`].
+    /// its solution while that stays positive. The oracle stops on a price and does not test
+    /// that, and two cases make it fail: a pool whose marginal price is already at the target
+    /// pays nothing for the smallest trade it will accept, and the unpriced-input branch above
+    /// answers with a cap rather than an optimum.
     ///
     /// It is not a small correction. A flow that consumes the order and pays nothing conserves
     /// at every node, so it is perfectly feasible and the coordinator will prefer it to
@@ -369,30 +278,12 @@ impl Edge {
         }
     }
 
-    /// Smallest input difference the root finding bothers to resolve.
-    ///
-    /// Scaled off the edge's own limit so a pool quoting in 6-decimal units and one quoting in
-    /// 18 get the same relative precision, with a floor of one raw unit since amounts are
-    /// integers.
-    fn bracket_tolerance(&self) -> BigUint {
-        let scaled = self
-            .max_in
-            .to_f64()
-            .map(|limit| limit * EDGE_REL_TOLERANCE)
-            .filter(|t| t.is_finite() && *t >= 1.0)
-            .map(|t| BigUint::from(t as u128));
-        scaled.unwrap_or_else(BigUint::one)
-    }
-
-    /// Simulates `amount_in` through this edge, returning the flow and its output as a float.
-    ///
-    /// No spot price is read here. The subproblem's derivative comes from secants of this
-    /// function, for the reason in the module docs.
+    /// Simulates `amount_in` through this edge.
     fn evaluate(
         &self,
         amount_in: &BigUint,
         market: &MarketState,
-    ) -> Result<(EdgeFlow, f64), AlgorithmError> {
+    ) -> Result<EdgeFlow, AlgorithmError> {
         let sim = market
             .get_simulation_state(&self.component_id)
             .ok_or_else(|| AlgorithmError::DataNotFound {
@@ -413,66 +304,39 @@ impl Edge {
                 error: e.to_string(),
             })?;
 
-        let amount_out = result
-            .amount
-            .to_f64()
-            .filter(|out| out.is_finite())
-            .ok_or_else(|| AlgorithmError::Other("pool output does not fit a float".to_string()))?;
-        let flow =
-            EdgeFlow { amount_in: amount_in.clone(), amount_out: result.amount, gas: result.gas };
-        Ok((flow, amount_out))
+        Ok(EdgeFlow { amount_in: amount_in.clone(), amount_out: result.amount, gas: result.gas })
     }
 }
 
-/// How far a marginal price sits from the target, in the coordinate the interpolation is linear
-/// in. Negative while the edge is still worth feeding, positive once it is past its optimum.
+/// A raw price as the exact fraction [`SwapConstraint`] takes.
 ///
-/// That coordinate is `1/√h⁺`. For a constant-product curve `h⁺(w) = R_in·R_out/(R_in+w)²`, so
-/// `1/√h⁺(w) = (R_in+w)/√(R_in·R_out)` is exactly linear in `w` and one interpolation lands on
-/// the root; a tick curve is this shape piecewise, and a weighted or VM curve is monotone in the
-/// same direction, which is all regula falsi needs. `None` for a price the pool cannot quote,
-/// which leaves the next step to the halving safeguard.
-fn residual(marginal: f64, target_marginal: f64) -> Option<f64> {
-    if !(marginal.is_finite() && marginal > 0.0) ||
-        !(target_marginal.is_finite() && target_marginal > 0.0)
-    {
+/// Mirrors `to_raw_price` in `derived::computations::component_depth` without its decimal
+/// adjustment: every price in this module is already raw output units per raw input unit, which
+/// is the convention the constraint wants. `None` for a price the constraint cannot carry, which
+/// leaves the caller to treat the input as unpriced.
+fn raw_price(value: f64) -> Option<Price> {
+    if !(value.is_finite() && value > 0.0) {
         return None;
     }
-    Some(marginal.sqrt().recip() - target_marginal.sqrt().recip())
-}
-
-/// The next trial point: where the secant through the bracket's two residuals crosses zero,
-/// halving the bracket instead whenever that is not a usable interior point.
-///
-/// Computed as an integer fraction of the bracket so a bracket wider than `f64` can represent is
-/// still split exactly, and clamped strictly inside so a step always makes progress.
-fn interpolate(
-    low: &BigUint,
-    high: &BigUint,
-    low_residual: Option<f64>,
-    high_residual: Option<f64>,
-) -> BigUint {
-    let span = high - low;
-    let fraction = match (low_residual, high_residual) {
-        (Some(below), Some(above)) => (-below) / (above - below),
-        _ => 0.5,
-    };
-    let scaled = if fraction.is_finite() && fraction > 0.0 && fraction < 1.0 {
-        (fraction * FRACTION_SCALE as f64) as u64
+    let (mantissa, exponent, sign) = value.integer_decode();
+    if sign < 0 {
+        return None;
+    }
+    let mut numerator = BigUint::from(mantissa);
+    let mut denominator = BigUint::one();
+    let shift = usize::from(exponent.unsigned_abs());
+    if exponent >= 0 {
+        numerator <<= shift;
     } else {
-        FRACTION_SCALE / 2
-    };
-    let offset = (&span * BigUint::from(scaled.clamp(1, FRACTION_SCALE - 1))) /
-        BigUint::from(FRACTION_SCALE);
-    // A span of one raw unit never reaches here: the tolerance test stops first, and it floors
-    // at one. So both clamps leave a point strictly inside the bracket.
-    low + offset
-        .max(BigUint::one())
-        .min(&span - BigUint::one())
+        denominator <<= shift;
+    }
+    Some(Price { numerator, denominator })
 }
 
 #[cfg(test)]
 mod tests {
+    use num_traits::ToPrimitive;
+
     use super::*;
 
     fn token(byte: u8, symbol: &str) -> Token {
@@ -534,19 +398,6 @@ mod tests {
     }
 
     #[test]
-    fn test_bracket_tolerance_scales_with_limit() {
-        // 1e18 raw units at 1e-9 relative precision leaves a 1e9-unit bracket.
-        let large = edge(2.0, u64::MAX).bracket_tolerance();
-        assert!(large > BigUint::one());
-    }
-
-    #[test]
-    fn test_bracket_tolerance_floors_at_one_unit() {
-        // A tiny limit would scale below a single raw unit, which is not a resolvable amount.
-        assert_eq!(edge(2.0, 10).bracket_tolerance(), BigUint::one());
-    }
-
-    #[test]
     fn test_edge_flow_none_is_inactive() {
         let flow = EdgeFlow::none();
         assert!(!flow.is_active());
@@ -565,51 +416,50 @@ mod tests {
     }
 
     #[test]
-    fn test_residual_sign_follows_the_optimum() {
-        // Above the target the edge is still worth feeding, which is the negative side.
-        assert!(residual(4.0, 1.0).expect("priceable") < 0.0);
-        assert!(residual(1.0, 4.0).expect("priceable") > 0.0);
-        assert_eq!(residual(2.0, 2.0), Some(0.0));
+    fn test_raw_price_round_trips() {
+        for value in [1.0f64, 2.5, 1e-9, 2e-9, 1e18, 0.3333333333333333] {
+            let price = raw_price(value).expect("a positive finite price converts");
+            let numerator = price.numerator.to_f64().expect("fits");
+            let denominator = price
+                .denominator
+                .to_f64()
+                .expect("fits");
+            let recovered = numerator / denominator;
+            assert!((recovered - value).abs() <= value * 1e-15, "{value} came back as {recovered}");
+        }
     }
 
     #[test]
-    fn test_residual_rejects_unquotable_prices() {
-        assert_eq!(residual(0.0, 1.0), None);
-        assert_eq!(residual(f64::NAN, 1.0), None);
-        assert_eq!(residual(1.0, -1.0), None);
+    fn test_raw_price_rejects_unusable_values() {
+        assert!(raw_price(0.0).is_none());
+        assert!(raw_price(-1.0).is_none());
+        assert!(raw_price(f64::NAN).is_none());
+        assert!(raw_price(f64::INFINITY).is_none());
     }
 
     #[test]
-    fn test_interpolate_lands_on_the_root_of_a_linear_residual() {
-        // Residuals -1 at 0 and +3 at 4000 put the root a quarter of the way along.
-        let trial = interpolate(&BigUint::zero(), &BigUint::from(4_000u32), Some(-1.0), Some(3.0));
-        assert_eq!(trial, BigUint::from(1_000u32));
+    fn test_worth_trading_drops_a_flow_that_pays_nothing() {
+        let edge = edge(2.0, 1_000);
+        let flow = EdgeFlow {
+            amount_in: BigUint::from(10u32),
+            amount_out: BigUint::zero(),
+            gas: BigUint::zero(),
+        };
+        assert!(!edge
+            .worth_trading(flow, 1.0, 1.0)
+            .is_active());
     }
 
     #[test]
-    fn test_interpolate_halves_without_usable_residuals() {
-        let trial = interpolate(&BigUint::zero(), &BigUint::from(1_000u32), None, Some(1.0));
-        assert_eq!(trial, BigUint::from(500u32));
-        // Residuals that do not straddle zero would extrapolate outside the bracket.
-        let trial = interpolate(&BigUint::zero(), &BigUint::from(1_000u32), Some(1.0), Some(3.0));
-        assert_eq!(trial, BigUint::from(500u32));
-    }
-
-    #[test]
-    fn test_interpolate_stays_inside_the_bracket() {
-        // A root all but on an endpoint must still move the trial off it, or the search stalls.
-        let span = 1_000_000u32;
-        let trial = interpolate(&BigUint::zero(), &BigUint::from(span), Some(-1e-18), Some(1.0));
-        assert!(trial > BigUint::zero() && trial < BigUint::from(span));
-        let trial = interpolate(&BigUint::zero(), &BigUint::from(span), Some(-1.0), Some(1e-18));
-        assert!(trial > BigUint::zero() && trial < BigUint::from(span));
-    }
-
-    #[test]
-    fn test_interpolate_splits_a_bracket_wider_than_f64() {
-        // Integer arithmetic throughout: a span past f64's range still splits exactly.
-        let high = BigUint::from(1u32) << 1_200u32;
-        let trial = interpolate(&BigUint::zero(), &high, Some(-1.0), Some(1.0));
-        assert_eq!(trial, &high / 2u32);
+    fn test_worth_trading_keeps_a_profitable_flow() {
+        let edge = edge(2.0, 1_000);
+        let flow = EdgeFlow {
+            amount_in: BigUint::from(10u32),
+            amount_out: BigUint::from(21u32),
+            gas: BigUint::zero(),
+        };
+        assert!(edge
+            .worth_trading(flow, 1.0, 1.0)
+            .is_active());
     }
 }

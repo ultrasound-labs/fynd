@@ -24,19 +24,23 @@ pub(crate) const MAX_ITERATIONS: usize = 200;
 /// circling a point it has already found: the shipped `1e-7` against a bisected subproblem's
 /// `1e-3` is what left runs ending on the iteration cap with hundreds of iterations spent after
 /// the answer was in hand.
+///
+/// The subproblem is now exact to the pool's own arithmetic rather than to a bracket, so the
+/// floor is far below this. It is kept where it is because a tenth of a basis point of net flow
+/// is already past what `MIN_LEG_FRACTION` can express, and iterations spent past it buy nothing
+/// a route can carry.
 pub(crate) const STATIONARITY_TOLERANCE: f64 = 1e-4;
 
-/// Maximum root-finding steps for one edge subproblem.
+/// How far above the requested marginal price the edge subproblem's answer may land.
 ///
-/// Each step costs one `get_amount_out`, so this is the dominant simulation cost. The subproblem
-/// is solved by regula falsi rather than bisection
-/// ([`edge::Edge::solve`](super::edge::Edge::solve)), which converges superlinearly and so spends
-/// most of its steps below this cap; the cap matters only for a curve the interpolation cannot
-/// predict.
-pub(crate) const MAX_EDGE_ITERATIONS: usize = 12;
-
-/// Root finding stops once the bracket is this fraction of the edge's upper bound.
-pub(crate) const EDGE_REL_TOLERANCE: f64 = 1e-9;
+/// Passed to [`SwapConstraint::PoolTargetPrice`](tycho_simulation::tycho_core::simulation::protocol_sim::SwapConstraint),
+/// which guarantees the pool's price ends in `[target, target · (1 + tolerance)]`. Zero, like
+/// `ComponentDepthComputation` uses, and for the same reason it cannot be loosened to save work:
+/// a relative error in the marginal price becomes an error in the *flow* amplified by pool depth
+/// over order size, so a tolerance of one basis point on a pool ten thousand times the order is
+/// a flow error of half the order. The generic search pays for this in iterations; a pool with a
+/// closed form does not pay at all.
+pub(crate) const TARGET_PRICE_TOLERANCE: f64 = 0.0;
 
 /// Cap on edge subproblem solves across one whole solve.
 ///
