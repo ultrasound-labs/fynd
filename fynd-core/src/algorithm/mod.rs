@@ -22,6 +22,8 @@
 //! change here is needed.
 
 pub mod bellman_ford;
+/// Convex flow routing over the whole pool network.
+pub mod convex_flow;
 pub mod most_liquid;
 pub mod path_frank_wolfe;
 pub(crate) mod path_scoring;
