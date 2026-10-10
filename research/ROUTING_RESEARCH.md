@@ -26,6 +26,33 @@ the one pair — so the comparison isolates allocation from everything else. `wa
 optimum: zero to two decimal places, a worst case of one hundredth of a basis point, and two
 orders where it edges the reference by using a pool outside the six the reference considers.
 
+### The same measurement on orders that are not all the same size
+
+**The paragraph below this one was measured on thousand-dollar orders, and that turned out to be
+most of what it said.** `bench-harness/src/scenarios.rs` builds a dataset that sweeps order size
+against each pair's own depth, liquidity tier, and pools per pair; on it, 41% of orders need a
+split against 5% of the recorded set's, and the four shipped algorithms stop agreeing. Shortfall
+to the same optimum, by quantile — the set contains orders larger than all the liquidity on their
+pair, so means are meaningless here:
+
+| config | orders | median | p75 | p90 | p99 |
+|---|---|---|---|---|---|
+| **`WF_d3`** | 285 | 0.00 | 0.00 | **0.01** | 3.1 |
+| `PFW_d3` | 365 | 0.00 | 0.58 | 10.51 | 5796.0 |
+| `BF_d3` | 373 | 0.00 | 0.88 | 15.09 | 5796.0 |
+| `ML_d3` | 373 | 0.00 | 0.82 | 13.32 | 5796.0 |
+| `CF_d2` | 271 | 0.00 | 2.30 | 987.68 | 9902.4 |
+
+Two things change and one does not. **`water_fill`'s allocation is still at the optimum** —
+0.01 bps at the p90, where the recorded set said 0.00 — so the verdict on convex optimisation
+stands on both datasets. But **splitting itself is worth 10 to 15 bps at the p90 and thousands at
+the p99**, which the recorded dataset could not show at all: there, not splitting cost 0.01 to
+0.47 bps. The algorithms were never within 1 bp of each other; the orders were.
+
+The same caveat applies to the published figure this reproduces. Xi and Moallemi's 0.055 bps is
+measured on realised flow, so it describes the orders people actually send, not the tail where
+the routing decision is worth something.
+
 So there is no allocation problem to solve here. The splitting step of the algorithm that wins
 today is already optimal to within a hundredth of a basis point of a gas-aware optimum, which
 independently reproduces the only published audit of the question — Xi and Moallemi measure a
@@ -37,7 +64,8 @@ Three further things the reference measured, each worth more than the verdict on
 
 - **The optimum splits across more than one pool on 8 of the 148 orders it solved.** On a dataset
   of roughly thousand-dollar orders, charging gas per pool, the best thing to do is usually to use
-  one pool. Splitting is a large-order instrument and this dataset is not large orders.
+  one pool. Splitting is a large-order instrument and this dataset is not large orders — which is
+  what the scenario set above was built to fix, and on it the figure is 212 of 515.
 - **Every shipped algorithm beats the single-pair optimum, by up to 180 bps**, and the first
   mechanism is not what one would guess: `BF_d2`'s two-leg answer on `WETH → USDC` is
   `WETH → ETH` through the native wrapper and then `ETH → USDC`. The gain is reaching pools

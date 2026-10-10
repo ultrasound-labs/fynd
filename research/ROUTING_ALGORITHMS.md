@@ -12,12 +12,18 @@ when the pool set is held fixed: **0.055 bps**. Over the same sample, losing a s
 pool state costs **1.3 to 1.8 bps**, and failing to activate the right pools is "the overwhelming
 driver of suboptimality".
 
-Experiment 1 below has since been built and run. Against a single-pair gas-aware optimum over the
-recorded market, `water_fill`'s allocation is short by a **mean of −0.00 bps**, a worst case of
-**0.01 bps** over 66 like-for-like orders; `most_liquid` by 0.01 bps. The full table is in
-[ROUTING_RESEARCH.md](ROUTING_RESEARCH.md#verdict). The allocation step is not approximately
-optimal here, it is optimal, and a better convex optimiser is chasing the smallest of the three
-terms while the two larger ones are not optimisation problems.
+Experiment 1 below has since been built and run, twice: once on realised flow and once on a
+dataset built to span order sizes and liquidity tiers, because the first one turned out to be
+answering an easier question than it looked. On both, `water_fill`'s allocation is at the
+optimum — **0.00 bps mean** on realised flow, **0.01 bps at the p90** on the wide set — so a
+better convex optimiser is chasing the smallest of the three terms while the two larger ones are
+not optimisation problems.
+
+What the wide set does change is how much the *other* algorithms lose by not splitting: 10 to
+15 bps at the p90 and thousands at the p99, against 0.01 to 0.47 bps on realised flow. So "the
+four algorithms are within 1.1 bps of each other" was a fact about thousand-dollar orders, not
+about the algorithms, and the same caveat applies to the 0.055 bps above — it too is measured on
+realised flow. Both tables are in [ROUTING_RESEARCH.md](ROUTING_RESEARCH.md#verdict).
 
 That does not make the methods below uninteresting — one of them is a clear improvement to the
 algorithm that wins today, for a reason that has nothing to do with allocation quality. It does
@@ -41,8 +47,11 @@ the wei, on 124 to 135 of the 193 orders they share. Where `water_fill` wins its
 not because it allocates better than Bellman-Ford; it is because it finds a split across pools
 Bellman-Ford never considered.
 
-The allocation step is not the differentiator in our own data either. Which liquidity is in the
-candidate set is.
+That near-agreement is a property of the dataset. On the wide scenario set the same four separate
+cleanly — `water_fill` wins 244 orders and loses none, where `bellman_ford` wins 52 — and the
+reason is the same one: it splits and they mostly do not. Which liquidity reaches the candidate
+set, and whether the order is big enough for that to matter, is the differentiator. The
+allocation arithmetic is not.
 
 ## Two things in the codebase worth more than any algorithm choice
 
