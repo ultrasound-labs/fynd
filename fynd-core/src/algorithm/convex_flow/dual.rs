@@ -47,8 +47,8 @@ use tracing::debug;
 use super::{
     super::convex_flow::Deadline,
     config::{
-        ARMIJO_COEFFICIENT, BACKTRACK_FACTOR, GAP_TOLERANCE, INITIAL_STEP, LINE_SEARCH_MEMORY,
-        MAX_BACKTRACKS, MAX_EDGE_SOLVES, MAX_ITERATIONS, MAX_STEP, MIN_STEP,
+        ARMIJO_COEFFICIENT, BACKTRACK_FACTOR, INITIAL_STEP, LINE_SEARCH_MEMORY, MAX_BACKTRACKS,
+        MAX_EDGE_SOLVES, MAX_ITERATIONS, MAX_STEP, MIN_STEP, STATIONARITY_TOLERANCE,
     },
     edge::{Edge, EdgeFlow},
 };
@@ -64,6 +64,74 @@ pub(crate) struct DualPoint {
     pub flows: Vec<EdgeFlow>,
     /// Sum of squared net flows, as a scale-free feasibility measure.
     pub residual: f64,
+    /// Whether every edge was solved, or the simulation budget cut the pass short.
+    ///
+    /// An incomplete pass leaves the unreached edges idle, so its flows are honest — they are a
+    /// flow the network could carry — but its *value* is missing those edges' contributions and
+    /// comes out lower than it should. Values from passes over different edge sets are not
+    /// comparable, which is what this flag protects the line search from.
+    pub complete: bool,
+}
+
+/// The point the coordinator will return, ranked by primal feasibility first.
+///
+/// Ranking on the dual value is the obvious reading of "best so far" and is the wrong one here.
+/// The dual value bounds the order's output, so over the whole region the iterates visit it
+/// varies by the slippage the order pays — basis points — while the net-flow residual over that
+/// same region varies by eight orders of magnitude. The route is built from the flows, and flows
+/// that do not conserve cannot be walked into legs, so the comparison has to be able to see that
+/// difference: feasibility first, and then the dual value, which is the bound on the order's
+/// output and so the right way to choose between two flows that both conserve.
+#[derive(Clone, Copy)]
+struct Candidate {
+    residual: f64,
+    value: f64,
+    carries_flow: bool,
+}
+
+impl Candidate {
+    fn of(point: &DualPoint) -> Self {
+        Self {
+            residual: point.residual,
+            value: point.value,
+            carries_flow: point
+                .flows
+                .iter()
+                .any(EdgeFlow::is_active),
+        }
+    }
+
+    /// Whether the point conserves well enough for its dual value to be the thing that matters.
+    ///
+    /// The threshold is [`STATIONARITY_TOLERANCE`] squared because the residual is a sum of
+    /// squared net flows and the tolerance is a norm, so this is the same condition the
+    /// coordinator stops on.
+    fn conserves(&self) -> bool {
+        self.residual <= STATIONARITY_TOLERANCE * STATIONARITY_TOLERANCE
+    }
+
+    /// Whether this point is a better one to return than `other`.
+    ///
+    /// A point where every edge is idle comes first for conservation — the whole order unspent
+    /// is in perfect balance — and it is the one point that provably cannot become a route,
+    /// since there is no flow to walk from `token_in` to `token_out`. On the recorded market the
+    /// iterates spend most of their time alternating between that point and a saturated one, so
+    /// ranking on the residual alone returns the idle point and the solve reports no route where
+    /// a flow that over-trades would have clamped into a real, honestly-priced one. Carrying
+    /// flow therefore outranks conserving, and the residual decides among the points that do.
+    fn improves_on(&self, other: &Self) -> bool {
+        match (self.carries_flow, other.carries_flow) {
+            (true, false) => return true,
+            (false, true) => return false,
+            _ => {}
+        }
+        match (self.conserves(), other.conserves()) {
+            (true, true) => self.value < other.value,
+            (true, false) => true,
+            (false, true) => false,
+            (false, false) => self.residual < other.residual,
+        }
+    }
 }
 
 /// The reduced dual for one order over one edge set.
@@ -148,11 +216,13 @@ impl<'a> DualProblem<'a> {
 
         let mut net_flow = vec![0.0; self.num_nodes];
         let mut flows = Vec::with_capacity(self.edges.len());
+        let mut complete = true;
         let mut value = prices[self.node_in] * self.amount_in;
         net_flow[self.node_in] = self.amount_in;
 
         for edge in self.edges {
             let flow = if *budget == 0 {
+                complete = false;
                 EdgeFlow::none()
             } else {
                 let (flow, sims) =
@@ -183,14 +253,17 @@ impl<'a> DualProblem<'a> {
             .iter()
             .map(|g| g * g)
             .sum::<f64>();
-        Ok(DualPoint { value: value / self.value_scale, gradient, flows, residual })
+        Ok(DualPoint { value: value / self.value_scale, gradient, flows, residual, complete })
     }
 
-    /// Minimises the dual from `start`, returning the best point it reached.
+    /// Minimises the dual from `start`, returning the most feasible point it reached.
     ///
     /// Stops on convergence, on the iteration cap, on the simulation budget, or on the deadline —
     /// and in every case returns the best point seen rather than an error, because a worker that
-    /// runs out of time still owes the router a route.
+    /// runs out of time still owes the router a route. "Best" is [`Candidate`]'s ordering, and
+    /// every point the solver evaluates is a candidate, line-search trials included: the
+    /// backtracking is what crosses the region where edges first take flow, so that is where the
+    /// feasible points are found.
     pub fn minimise(
         &self,
         start: Vec<f64>,
@@ -201,9 +274,8 @@ impl<'a> DualProblem<'a> {
         let mut prices = self.project(start);
         let mut point = self.evaluate(&prices, market, &mut budget)?;
 
-        let mut best_value = point.value;
+        let mut best = Candidate::of(&point);
         let mut best_flows = point.flows.clone();
-        let mut best_residual = point.residual;
 
         let mut step = INITIAL_STEP;
         let mut history = vec![point.value];
@@ -242,7 +314,7 @@ impl<'a> DualProblem<'a> {
             // Barzilai-Borwein length shrinks as iterates settle, which shrinks `direction` and
             // with it `slope`, so a test on `slope` reports convergence whenever the step gets
             // small whatever the gradient still says.
-            if self.stationarity(&prices, &point.gradient) <= GAP_TOLERANCE {
+            if self.stationarity(&prices, &point.gradient) <= STATIONARITY_TOLERANCE {
                 debug!(iteration, "convex flow converged");
                 break;
             }
@@ -262,6 +334,14 @@ impl<'a> DualProblem<'a> {
                     .map(|(p, d)| p + alpha * d)
                     .collect();
                 let evaluated = self.evaluate(&candidate, market, &mut budget)?;
+                if Candidate::of(&evaluated).improves_on(&best) {
+                    best = Candidate::of(&evaluated);
+                    best_flows = evaluated.flows.clone();
+                }
+                if !evaluated.complete {
+                    debug!(iteration, "convex flow ran out of simulations mid line search");
+                    break;
+                }
                 if evaluated.value <= reference + ARMIJO_COEFFICIENT * alpha * slope {
                     accepted = Some((candidate, evaluated));
                     break;
@@ -299,11 +379,6 @@ impl<'a> DualProblem<'a> {
             prices = next_prices;
             point = next_point;
 
-            if point.value < best_value {
-                best_value = point.value;
-                best_flows = point.flows.clone();
-                best_residual = point.residual;
-            }
             history.push(point.value);
             if history.len() > LINE_SEARCH_MEMORY {
                 history.remove(0);
@@ -314,7 +389,7 @@ impl<'a> DualProblem<'a> {
             flows: best_flows,
             iterations,
             edge_solves: MAX_EDGE_SOLVES - budget,
-            residual: best_residual,
+            residual: best.residual,
         })
     }
 

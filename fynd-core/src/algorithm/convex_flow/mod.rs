@@ -22,7 +22,7 @@
 //!
 //! # Cost
 //!
-//! The expensive part is the per-edge bisection, and most edges never reach it: the no-flow test
+//! The expensive part is the per-edge root finding, and most edges never reach it: the no-flow test
 //! in `Edge::carries_no_flow` rejects an edge from its fee-inclusive spot price alone,
 //! which the graph already carries. What remains is bounded by
 //! `config::MAX_EDGE_SOLVES` and by the worker's deadline, and the solver returns its best
@@ -404,7 +404,7 @@ fn price_to_f64(
 ///
 /// Without this an edge's bracket is whatever `get_limits` reports, which on a deep pool is far
 /// beyond anything this order could push through it. A dual iterate is free to be infeasible, so
-/// the bisection will happily propose that trade, and the resulting net flows are large enough
+/// the root finding will happily propose that trade, and the resulting net flows are large enough
 /// to make the line search meaningless. Value is conserved along a route up to fees, so the
 /// order's own value bounds every edge on it.
 fn cap_edges_to_order_value(network: &mut Network, reference: &[f64], order: &Order) {
@@ -424,10 +424,15 @@ fn cap_edges_to_order_value(network: &mut Network, reference: &[f64], order: &Or
         if !(token_price.is_finite() && token_price > 0.0) {
             continue;
         }
+        // A cap that rounds below one raw unit means this order is not worth a single unit of
+        // the edge's input token at the reference prices. Leaving the edge uncapped there is the
+        // worst available answer: an iterate may then propose the pool's entire `get_limits`,
+        // and the net flow that reports is scaled by the very reference price that made the cap
+        // sub-unit, so the dual's residual lands tens of orders of magnitude out. One raw unit
+        // is the smallest honest bracket. An infinite cap is a different thing and keeps meaning
+        // no constraint, which `f64 as u128` saturates into.
         let cap = order_value * EDGE_VALUE_SLACK / token_price;
-        if !(cap.is_finite() && cap >= 1.0) {
-            continue;
-        }
+        let cap = if cap >= 1.0 { cap } else { 1.0 };
         let cap = BigUint::from(cap as u128);
         if cap < edge.max_in {
             edge.max_in = cap;
@@ -701,6 +706,18 @@ impl Algorithm for ConvexFlowAlgorithm {
             (Err(error), None) => return Err(error),
         };
 
+        // A route that pays nothing is not a route. The coordinator returns the best point it
+        // reached and that point need not be primal feasible, so an order too small to move any
+        // pool can still walk into legs whose every output truncates to zero. Reporting no route
+        // is both the honest answer and the useful one: the router ranks on output, and a
+        // zero-output candidate can only displace a real one in the logs.
+        if route
+            .amount_out(order.token_out())
+            .is_zero()
+        {
+            return Err(AlgorithmError::InsufficientLiquidity);
+        }
+
         // Gas does not steer the search, but the result must still be comparable with the other
         // worker pools, which rank on output net of gas. Converted through the same helper the
         // other split algorithm uses, so the two are measured the same way.
@@ -823,6 +840,33 @@ mod tests {
             reserve_1: BigUint::from(reserve_1),
             gas: 100_000,
         })
+    }
+
+    /// A fee-bearing constant-product pool, reserves in raw units.
+    ///
+    /// Every other pool in this module is fee-free, which is the one thing a real market never
+    /// is. The subproblem's optimality condition compares a quoted marginal price against the
+    /// curve `get_amount_out` walks, so a fee only one of the two accounts for solves for the
+    /// wrong root — by the ratio of the fee to the order's own price impact, which for a small
+    /// order is a factor of hundreds. A zero-fee double cannot see that at all.
+    fn fee_pool(
+        reserve_0: u128,
+        reserve_1: u128,
+        fee_bps: u32,
+    ) -> Box<dyn tycho_simulation::tycho_common::simulation::protocol_sim::ProtocolSim> {
+        Box::new(crate::algorithm::test_utils::FeeConstantProductSim {
+            reserve_0: BigUint::from(reserve_0),
+            reserve_1: BigUint::from(reserve_1),
+            gas: 100_000,
+            fee_bps,
+        })
+    }
+
+    /// What a fee-bearing pool pays for `amount_in`, by the formula `fee_pool` uses.
+    fn fee_cp_out(amount_in: u128, reserve_in: u128, reserve_out: u128, fee_bps: u32) -> BigUint {
+        let net_in =
+            BigUint::from(amount_in) * BigUint::from(10_000 - fee_bps) / BigUint::from(10_000u32);
+        &net_in * BigUint::from(reserve_out) / (BigUint::from(reserve_in) + &net_in)
     }
 
     /// What a pool pays for `amount_in`, by the same constant-product formula the mock uses:
@@ -973,8 +1017,8 @@ mod tests {
         let got = result
             .route()
             .amount_out(&token_c.address);
-        // Bisection resolves the input to a fraction of the pool's limit rather than exactly, so
-        // compare within a basis point rather than to the wei.
+        // The subproblem resolves the input to a fraction of the pool's limit rather than
+        // exactly, so compare within a basis point rather than to the wei.
         let tolerance = &expected / 10_000u32;
         let diff = if got > expected { &got - &expected } else { &expected - &got };
         assert!(diff <= tolerance, "expected ~{expected}, got {got}");
@@ -1111,6 +1155,11 @@ mod tests {
     /// interaction is what matters: at an intermediate token the first hop's output has to be
     /// the second hop's input, and `f64` carries about sixteen significant digits. The sweep
     /// shows whether conservation survives once the amounts outrun that.
+    ///
+    /// It starts at `1e6`, a thousand raw units against a million-unit pool. A decade below that
+    /// the order is one raw unit, the first hop pays zero for it by integer division, and the
+    /// expected output of the whole route is zero — there is no route to find, which
+    /// `test_two_hop_pays_nothing_for_a_single_raw_unit` pins separately.
     #[tokio::test]
     async fn test_two_hop_scales_with_magnitude() {
         let token_a = mk_token(0x0A, "A");
@@ -1118,7 +1167,7 @@ mod tests {
         let token_c = mk_token(0x0C, "C");
 
         let mut outcomes: Vec<String> = Vec::new();
-        for exponent in [3u32, 6, 9, 12, 15, 18, 21, 24] {
+        for exponent in [6u32, 9, 12, 15, 18, 21, 24] {
             let reserve = 10u128.pow(exponent);
             let amount = reserve / 1_000;
             let (market, manager) = setup_market_weighted_boxed(vec![
@@ -1152,6 +1201,134 @@ mod tests {
             "two-hop solves break as amounts grow:\n  {}",
             outcomes.join("\n  ")
         );
+    }
+
+    /// A one-raw-unit order over two hops: the first pool pays zero for it by integer division,
+    /// so there is no flow worth taking and the solver must say so.
+    ///
+    /// The point of pinning it is what the alternative looks like. A flow that swallows the whole
+    /// order and pays nothing out conserves at every token, so it is perfectly feasible, and a
+    /// coordinator that ranks points on conservation prefers it to every other point it will
+    /// ever see. It also puts the dual value below the optimum it is supposed to bound. The
+    /// subproblem refuses it instead, in `Edge::worth_trading`.
+    #[tokio::test]
+    async fn test_two_hop_pays_nothing_for_a_single_raw_unit() {
+        let token_a = mk_token(0x0A, "A");
+        let token_b = mk_token(0x0B, "B");
+        let token_c = mk_token(0x0C, "C");
+        let (market, manager) = setup_market_weighted_boxed(vec![
+            ("ab", &token_a, &token_b, pool(1_000, 1_000)),
+            ("bc", &token_b, &token_c, pool(1_000, 1_000)),
+        ]);
+
+        let order = sell(&token_a, &token_c, 1);
+        let result = ConvexFlowAlgorithm::default()
+            .find_best_route(SolveRequest::new(manager.graph(), market, &order))
+            .await;
+
+        assert!(
+            matches!(result, Err(AlgorithmError::InsufficientLiquidity)),
+            "a route that pays nothing is not a route: {result:?}"
+        );
+    }
+
+    /// The single-pool solve, with a fee on the pool.
+    ///
+    /// The optimum is still forced — one pool, one direction — so this says whether the
+    /// subproblem's optimality condition holds when the marginal price and `get_amount_out`
+    /// both carry a fee. A solver comparing a fee-free marginal against a fee-bearing curve
+    /// solves for a root that is wrong by the fee, which on an order this size is most of the
+    /// pool.
+    #[tokio::test]
+    async fn test_solve_single_fee_pool_sends_the_whole_order() {
+        let token_a = mk_token(0x0A, "A");
+        let token_c = mk_token(0x0C, "C");
+        let (reserve_a, reserve_c) = (1_000e18 as u128, 2_000e18 as u128);
+        let fee_bps = 30;
+        let (market, manager) = setup_market_weighted_boxed(vec![(
+            "p",
+            &token_a,
+            &token_c,
+            fee_pool(reserve_a, reserve_c, fee_bps),
+        )]);
+
+        let amount = 1e18 as u128;
+        let order = sell(&token_a, &token_c, amount);
+        let result = ConvexFlowAlgorithm::default()
+            .find_best_route(SolveRequest::new(manager.graph(), market, &order))
+            .await
+            .expect("the only route must be found through a fee-bearing pool");
+
+        let expected = fee_cp_out(amount, reserve_a, reserve_c, fee_bps);
+        let got = result
+            .route()
+            .amount_out(&token_c.address);
+        let tolerance = &expected / 10_000u32;
+        let diff = if got > expected { &got - &expected } else { &expected - &got };
+        assert!(diff <= tolerance, "expected ~{expected}, got {got}");
+    }
+
+    /// Fee-bearing pools of different depths and different fees, which is what a real pair looks
+    /// like. The split must still beat sending everything through the cheapest one.
+    #[tokio::test]
+    async fn test_solve_fee_pools_split_beats_the_best_single() {
+        let token_a = mk_token(0x0A, "A");
+        let token_c = mk_token(0x0C, "C");
+        let deep = 10_000e18 as u128;
+        let (market, manager) = setup_market_weighted_boxed(vec![
+            ("deep_5bp", &token_a, &token_c, fee_pool(deep, 2 * deep, 5)),
+            ("mid_30bp", &token_a, &token_c, fee_pool(deep / 2, deep, 30)),
+            ("shallow_100bp", &token_a, &token_c, fee_pool(deep / 10, deep / 5, 100)),
+        ]);
+
+        let amount = 100e18 as u128;
+        let order = sell(&token_a, &token_c, amount);
+        let result = ConvexFlowAlgorithm::default()
+            .find_best_route(SolveRequest::new(manager.graph(), market, &order))
+            .await
+            .expect("three pools serve the pair");
+
+        let best_single = fee_cp_out(amount, deep, 2 * deep, 5);
+        assert!(
+            result
+                .route()
+                .amount_out(&token_c.address) >=
+                best_single,
+            "a split across fee-bearing pools must not pay less than the cheapest single pool"
+        );
+    }
+
+    /// A two-hop route through fee-bearing pools, which is where a fee the marginal price does
+    /// not account for compounds: the second hop is fed whatever the first one really paid.
+    #[tokio::test]
+    async fn test_solve_fee_two_hop_conserves_at_the_intermediate_token() {
+        let token_a = mk_token(0x0A, "A");
+        let token_b = mk_token(0x0B, "B");
+        let token_c = mk_token(0x0C, "C");
+        let reserve = 10_000e18 as u128;
+        let fee_bps = 30;
+        let (market, manager) = setup_market_weighted_boxed(vec![
+            ("ab", &token_a, &token_b, fee_pool(reserve, reserve, fee_bps)),
+            ("bc", &token_b, &token_c, fee_pool(reserve, reserve, fee_bps)),
+        ]);
+
+        let amount = 1e18 as u128;
+        let order = sell(&token_a, &token_c, amount);
+        let result = ConvexFlowAlgorithm::default()
+            .find_best_route(SolveRequest::new(manager.graph(), market, &order))
+            .await
+            .expect("the two-hop route must be found");
+
+        let mid: u128 = fee_cp_out(amount, reserve, reserve, fee_bps)
+            .try_into()
+            .expect("fits");
+        let expected = fee_cp_out(mid, reserve, reserve, fee_bps);
+        let got = result
+            .route()
+            .amount_out(&token_c.address);
+        let tolerance = &expected / 1_000u32;
+        let diff = if got > expected { &got - &expected } else { &expected - &got };
+        assert!(diff <= tolerance, "expected ~{expected}, got {got}");
     }
 
     /// Sweeps how small the order is relative to pool depth, on a fixed two-hop market.
@@ -1188,24 +1365,145 @@ mod tests {
         );
     }
 
-    /// Records where the solver currently stops scaling, so the limit is a known number rather
-    /// than something rediscovered on the next benchmark.
+    /// The same sweep carried as far as the fixture can express, so the scaling limit is a known
+    /// number rather than something rediscovered on the next benchmark.
     ///
-    /// Ignored because it fails: at 32 intermediate tokens the answer slips just below the
-    /// direct pool's output, and by 64 it finds no route at all. The sweeps above assert the
-    /// range that does hold. Whatever fixes this should delete the `ignore` rather than widen
-    /// the bound.
+    /// 128 middles is 130 tokens and 257 edges. The sweep stops there because `mk_token` derives
+    /// an address from a single byte and 256 middles runs out of them, not because the solve
+    /// does: whatever moves this bound has to widen the fixture first.
     #[tokio::test]
-    #[ignore = "known limit: convex flow stops scaling somewhere between 18 and 34 tokens"]
     async fn test_solve_scales_past_thirty_tokens() {
         let amount = 1e18 as u128;
         let floor = cp_out(amount, 10_000e18 as u128, 10_000e18 as u128);
-        for middles in [32usize, 64] {
+        for middles in [32usize, 64, 128] {
             let out = solve_with_middles(middles, amount, false)
                 .await
                 .unwrap_or_else(|error| panic!("{middles} middles: {error}"));
             assert!(out >= floor, "{middles} middles: paid {out}, below the direct pool's {floor}");
         }
+    }
+
+    /// An edge whose input token is worth more than the whole order must still be bracketed.
+    ///
+    /// The recorded market has these: a token priced high enough against the order that its
+    /// value cap rounds below a single raw unit. Skipping the cap there leaves the edge with
+    /// whatever `get_limits` reports, which is how a 10-token solve came back with a net-flow
+    /// residual of 2.8e52 — the bracket was a deep pool's entire limit, and the reference price
+    /// that made the cap sub-unit scaled the resulting flow right back up.
+    #[test]
+    fn test_cap_edges_floors_at_one_raw_unit() {
+        // Only an intermediate token can have a sub-unit cap: on an edge out of `token_in` the
+        // reference price cancels, leaving the cap at `EDGE_VALUE_SLACK` times the order.
+        let mut net = network(vec![edge(0, 1, "a"), edge(1, 2, "b")], 3);
+        let limit = net.edges[1].max_in.clone();
+        // One raw unit of the middle token is worth a billion orders.
+        let reference = vec![1.0, 1e9, 1.0];
+        cap_edges_to_order_value(&mut net, &reference, &sell_order(1));
+
+        assert_eq!(
+            net.edges[0].max_in,
+            BigUint::from(EDGE_VALUE_SLACK as u32),
+            "an edge out of token_in is capped at the order itself, plus the slack"
+        );
+        assert!(net.edges[1].max_in < limit, "the edge must be bracketed, not left at get_limits");
+        assert_eq!(net.edges[1].max_in, BigUint::from(1u32), "one raw unit is the floor");
+    }
+
+    /// Many edges *and* a tiny order, which is the quadrant the real market sits in and the one
+    /// the sweeps above leave out: `test_solve_scales_with_token_count` varies the token count at
+    /// a fixed relative size, and `test_two_hop_scales_with_relative_trade_size` varies the size
+    /// on a fixed two-hop market.
+    ///
+    /// The direct pool is in every one of these markets, so clearing its output is the floor
+    /// however many alternatives the solver is offered and however little of the pool the order
+    /// is worth. At these sizes splitting is worth almost nothing — the direct pool *is* the
+    /// answer — so what this really asserts is that the extra choices never make it worse.
+    #[tokio::test]
+    async fn test_solve_small_order_against_many_edges() {
+        let depth = 10_000e18;
+        let mut failures: Vec<String> = Vec::new();
+        for middles in [32usize, 64] {
+            for divisor in [1e4f64, 1e5, 1e6] {
+                let amount = (depth / divisor) as u128;
+                let floor = cp_out(amount, depth as u128, depth as u128);
+                match solve_with_middles(middles, amount, false).await {
+                    Ok(out) if out >= floor => {}
+                    Ok(out) => failures.push(format!(
+                        "{middles} middles, order = depth/{divisor:.0e}: paid {out}, below the \
+                         direct pool's {floor}"
+                    )),
+                    Err(error) => failures
+                        .push(format!("{middles} middles, order = depth/{divisor:.0e}: {error}")),
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "convex flow broke on a small order against many edges:\n  {}",
+            failures.join("\n  ")
+        );
+    }
+
+    /// The subproblem has to resolve a flow far below the bracket it searches.
+    ///
+    /// `cap_edges_to_order_value` brackets every edge by the order's own value, and a leg
+    /// carrying a ten-thousandth of the order is an ordinary leg — `MIN_LEG_FRACTION` admits
+    /// exactly that. A subproblem that resolves its bracket to a fixed fraction of itself, as
+    /// twelve bisection steps do, reports zero for anything below a thousandth of it. That is
+    /// not a rounding error in the answer, it is a staircase where the dual's gradient should
+    /// be: net flow then only moves in steps a thousand times larger than the leg the
+    /// coordinator is trying to size, and no step length can converge on it.
+    #[tokio::test]
+    async fn test_edge_resolves_flow_far_below_its_bracket() {
+        let token_a = mk_token(0x0A, "A");
+        let token_c = mk_token(0x0C, "C");
+        let reserve = 10_000e18 as u128;
+        let (market, manager) =
+            setup_market_weighted_boxed(vec![("p", &token_a, &token_c, pool(reserve, reserve))]);
+
+        let amount = 1e18 as u128;
+        let order = sell(&token_a, &token_c, amount);
+        let view = read_market(&market, None)
+            .await
+            .expect("market reads");
+        let search = RouteSearch {
+            bounds: &ConvexFlowAlgorithm::default().query,
+            exclusions: &RouteExclusions::default(),
+        };
+        let network =
+            Network::build(manager.graph(), &view, &order, search, &RouteExclusions::default())
+                .expect("network builds");
+        let ids: FxHashSet<&ComponentId> = network
+            .edges
+            .iter()
+            .map(|edge| &edge.component_id)
+            .collect();
+        let state = view.extract_subset_with_overlay(&ids);
+        drop(view);
+
+        // The bracket the coordinator would hand this edge, and a target a ten-thousandth of the
+        // order inside it — a fortieth of a thousandth of the bracket, so bisection at twelve
+        // steps cannot see it at all.
+        let bracket = amount * EDGE_VALUE_SLACK as u128;
+        let wanted = amount / 10_000;
+        let mut edge = network.edges[0].clone();
+        edge.max_in = BigUint::from(bracket);
+
+        // For this pool `h⁺(w) = R² / (R + w)²`, so the price ratio that puts the optimum at
+        // `wanted` is that evaluated there.
+        let ratio = (reserve as f64 / (reserve + wanted) as f64).powi(2);
+        let (flow, sims) = edge
+            .solve(ratio, 1.0, &state)
+            .expect("the pool prices every trade inside its own limit");
+
+        let got = flow.amount_in.to_f64().expect("fits");
+        let error = (got - wanted as f64).abs() / wanted as f64;
+        assert!(
+            error < 1e-3,
+            "wanted ~{wanted} in, got {} ({} simulations, relative error {error:.3e})",
+            flow.amount_in,
+            sims
+        );
     }
 
     /// A pool traded in both directions at once is not a trade anyone can execute.
@@ -1255,15 +1553,29 @@ mod tests {
     ///
     /// Evaluated away from the warm start, because the warm start sits on every edge's no-flow
     /// kink, where the derivative genuinely does not exist.
+    ///
+    /// The step is chosen against the amounts, not the prices. Flows are integers, so the dual
+    /// value is a step function below the price change that moves a flow by one raw unit, and a
+    /// central difference taken inside that scale measures rounding instead of a derivative: on
+    /// this market the relative error falls from 1.4 at a step of `1e-7` to `2e-15` at `1e-3`,
+    /// the wrong way round for truncation error. A step this coarse is still well inside the
+    /// region where edges carry flow, and the second-order envelope error it does admit stays
+    /// four orders below the tolerance here.
+    ///
+    /// The market is at wei magnitudes for the same reason read from the other side. The
+    /// identity being tested — that the gradient is the subproblem's own optimal flow — holds
+    /// only where the subproblem can find that optimum, and its difference quotient needs the
+    /// pool's output to move by more than the pool's integer rounding. A toy market cannot
+    /// supply that, and the gradient there is not wrong so much as undefined.
     #[tokio::test]
     async fn test_gradient_matches_finite_difference() {
         let (a, b, c) = (mk_token(0x0A, "A"), mk_token(0x0B, "B"), mk_token(0x0C, "C"));
         let (market, manager) = setup_market_weighted_boxed(vec![
-            ("ab", &a, &b, pool(1_000_000, 2_000_000)),
-            ("bc", &b, &c, pool(2_000_000, 1_500_000)),
-            ("ac", &a, &c, pool(1_000_000, 1_400_000)),
+            ("ab", &a, &b, pool(1_000e18 as u128, 2_000e18 as u128)),
+            ("bc", &b, &c, pool(2_000e18 as u128, 1_500e18 as u128)),
+            ("ac", &a, &c, pool(1_000e18 as u128, 1_400e18 as u128)),
         ]);
-        let order = sell(&a, &c, 10_000);
+        let order = sell(&a, &c, 10e18 as u128);
         let algorithm = ConvexFlowAlgorithm::default();
 
         let view = read_market(&market, None)
@@ -1305,7 +1617,7 @@ mod tests {
             .expect("evaluates")
             .gradient;
 
-        let h = 1e-4;
+        let h = 1e-3;
         for node in 0..network.tokens.len() {
             if node == network.node_out {
                 continue; // pinned; its gradient is deliberately zeroed
