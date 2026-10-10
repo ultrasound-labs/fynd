@@ -463,6 +463,16 @@ subproblem cheap â€” one simulation instead of twenty-four for the same answer â
 rate by half and tripled the orders lost, because the budget it freed was spent on further
 excursions to a zero price.
 
+## Where to look instead
+
+[ROUTING_ALGORITHMS.md](ROUTING_ALGORITHMS.md) surveys the methods that could replace this one
+and concludes that the premise is wrong: across 2.98 million recorded swaps, optimal allocation
+given a fixed pool set is worth **0.055 bps**, while one stale block costs **1.3 to 1.8 bps** and
+failing to activate the right pools dominates both. It also records two things found in this
+codebase while benchmarking, either of which would have saved most of the work above:
+`SwapConstraint::PoolTargetPrice` is the per-edge subproblem as a single analytic oracle call,
+and the fee-net marginal price is free from the derived spot-price table.
+
 ## Still worth doing, independent of all this
 
 **PRIME's ASGM allocation step** (arXiv 2603.08337), applied to `water_fill`'s exchange-refinement
