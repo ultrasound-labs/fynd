@@ -62,3 +62,7 @@ harness = false
 [[bench]]
 name = "derived"
 harness = false
+
+[[bench]]
+name = "scenarios"
+harness = false

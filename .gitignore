@@ -15,6 +15,8 @@ profile.json*
 
 # Benchmark trade datasets: tens of MB, rebuildable from bench-harness/data/dataset.sql
 aggregator_trades*.json
+# Rebuilt from the market fixture by `cargo bench -p fynd-bench-harness --bench scenarios`
+scenarios.json
 comparison_results.json
 scale_results*.json
 .env

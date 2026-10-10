@@ -24,6 +24,8 @@ pub(crate) mod live;
 /// The single-pair gas-aware optimum, registered by the benchmark binaries as a reference.
 pub mod optimum;
 pub mod profile;
+/// Builds a trade dataset spanning order sizes and liquidity tiers.
+pub mod scenarios;
 pub(crate) mod trades;
 
 use std::{

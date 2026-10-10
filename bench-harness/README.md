@@ -48,6 +48,47 @@ cargo's JSON output, so it is needed even with `--no-record`.
 **`samply`** only if you want flamegraphs: `cargo install samply`. The profiler runs without it
 using `--no-record`.
 
+## The scenario dataset: orders the recorded one does not contain
+
+`aggregator_trades_10k.json` is real aggregator flow, which is both its value and its blind spot:
+it is thousand-dollar orders on the busiest pairs. On that dataset every shipped algorithm's
+allocation is within a hundredth of a basis point of a true gas-aware optimum, and the optimum
+uses a single pool on 140 of the 148 orders it can answer. Nothing is wrong with the algorithms;
+the orders are just too small against the depth for a split to pay its own gas, so the dataset
+cannot tell a good router from a lucky one.
+
+`cargo bench --bench scenarios` builds a dataset that can, by sweeping the three axes the
+recorded one holds fixed:
+
+| axis | what it varies |
+|---|---|
+| size | seven rungs, from a ten-thousandth of the pair's own depth up to twice it |
+| liquidity | pairs sampled from the top, middle and lower-middle of the depth ranking |
+| pools per pair | a band that needs four or more, one that takes single-pool pairs, and the thin tail |
+
+Size is relative to the pair's depth rather than absolute, because an absolute size means
+nothing: a hundred thousand dollars is noise on WETH/USDC and the whole market on a thin pair.
+Both directions of every pair are emitted, since depth is not symmetric. The run prints the depth
+distribution it sampled from, which is how the tier positions were chosen and how they should be
+rechosen when the fixture is re-recorded.
+
+```bash
+cargo bench -p fynd-bench-harness --bench scenarios          # writes scenarios.json in the root
+./scripts/bench.sh --name wide --orders 0 --jobs 1 --timeout-ms 60000 \
+  --trades scenarios.json --configs OPT,WF_d3,BF_d3,ML_d3,PFW_d3
+```
+
+**Read it by quantile, not by mean.** The set deliberately contains orders larger than all the
+liquidity serving their pair, and on those a baseline that pushes everything through one pool
+comes out thousands of basis points behind — one order in the default set has a 169,000,000 bps
+spread. Those rows are the point of the set, and they make a mean meaningless. `--timeout-ms`
+wants raising too: a large order on an eleven-pool pair is real work.
+
+What it exposes, against what the recorded dataset shows for the same configs: the recorded set
+puts `water_fill`, `bellman_ford`, `most_liquid` and `path_frank_wolfe` within 1.1 bps of each
+other, and this one separates them by 10 to 15 bps at the p90 of shortfall-to-optimum and by
+thousands at the p99, because 41% of its orders need a split against 5% of the recorded set's.
+
 ## Measuring against the optimum, not against another algorithm
 
 Every bps figure here is measured against a baseline config, which answers "did this change
