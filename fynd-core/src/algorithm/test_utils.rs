@@ -459,6 +459,160 @@ impl ProtocolSim for ConstantProductSim {
     }
 }
 
+// ==================== FeeConstantProductSim ====================
+
+/// xy=k AMM simulator that charges a fee, for tests that need one.
+///
+/// [`ConstantProductSim`] is fee-free, which makes it blind to a whole class of defect: a solver
+/// that compares a pool's quoted marginal price against the output of its own `get_amount_out`
+/// only works if the two account for the fee the same way, and a zero-fee double cannot tell a
+/// correct comparison from one out by the fee. Real pools charge five to a hundred basis points.
+///
+/// The fee is taken off the input, as Uniswap V2 takes it, and [`ProtocolSim::spot_price`] returns
+/// the marginal price *of this curve* — the derivative of `get_amount_out`, fee included — which
+/// is the contract a marginal-price solver needs. For `out(w) = R_out·(1−φ)w / (R_in + (1−φ)w)`
+/// that derivative is `(1−φ)·R_in·R_out / (R_in + (1−φ)w)²`, which is `(1−φ)` times the reserve
+/// ratio after the trade.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FeeConstantProductSim {
+    /// Reserve of token 0 (lower-address token)
+    pub reserve_0: BigUint,
+    /// Reserve of token 1 (higher-address token)
+    pub reserve_1: BigUint,
+    /// Gas units per swap
+    pub gas: u64,
+    /// Fee charged on the input, in basis points
+    pub fee_bps: u32,
+}
+
+impl FeeConstantProductSim {
+    fn reserves_for(&self, token_a: &Token, token_b: &Token) -> (&BigUint, &BigUint) {
+        if token_a.address < token_b.address {
+            (&self.reserve_0, &self.reserve_1)
+        } else {
+            (&self.reserve_1, &self.reserve_0)
+        }
+    }
+
+    /// What is left of an input after the fee.
+    fn net_of_fee(&self, amount_in: &BigUint) -> BigUint {
+        amount_in * BigUint::from(10_000u32 - self.fee_bps) / BigUint::from(10_000u32)
+    }
+
+    /// `1 − φ`, the factor the fee removes from the marginal price.
+    fn fee_factor(&self) -> f64 {
+        f64::from(10_000 - self.fee_bps) / 10_000.0
+    }
+}
+
+#[typetag::serde]
+impl ProtocolSim for FeeConstantProductSim {
+    fn fee(&self) -> f64 {
+        f64::from(self.fee_bps) / 10_000.0
+    }
+
+    fn spot_price(&self, base: &Token, quote: &Token) -> Result<f64, SimulationError> {
+        let (reserve_in, reserve_out) = self.reserves_for(base, quote);
+        if reserve_in.is_zero() {
+            return Err(SimulationError::FatalError("reserve_in is zero".to_string()));
+        }
+        let ratio = BigRational::new(reserve_out.clone().into(), reserve_in.clone().into())
+            .to_f64()
+            .ok_or_else(|| {
+                SimulationError::FatalError("price ratio too large for f64".to_string())
+            })?;
+        Ok(ratio * self.fee_factor())
+    }
+
+    fn get_amount_out(
+        &self,
+        amount_in: BigUint,
+        token_in: &Token,
+        token_out: &Token,
+    ) -> Result<GetAmountOutResult, SimulationError> {
+        let (reserve_in, reserve_out) = self.reserves_for(token_in, token_out);
+
+        if &amount_in >= reserve_in {
+            return Err(SimulationError::InvalidInput(
+                "amount_in must be less than reserve_in".to_string(),
+                None,
+            ));
+        }
+
+        let net_in = self.net_of_fee(&amount_in);
+        let amount_out = &net_in * reserve_out / (reserve_in + &net_in);
+
+        // The whole input joins the reserve; only the fee-free part of it buys output, which is
+        // how the fee stays in the pool.
+        let (new_reserve_0, new_reserve_1) = if token_in.address < token_out.address {
+            (reserve_in + &amount_in, reserve_out - &amount_out)
+        } else {
+            (reserve_out - &amount_out, reserve_in + &amount_in)
+        };
+
+        let new_state = Box::new(FeeConstantProductSim {
+            reserve_0: new_reserve_0,
+            reserve_1: new_reserve_1,
+            gas: self.gas,
+            fee_bps: self.fee_bps,
+        });
+
+        Ok(GetAmountOutResult::new(amount_out, BigUint::from(self.gas), new_state))
+    }
+
+    fn get_limits(
+        &self,
+        sell_token: Bytes,
+        buy_token: Bytes,
+    ) -> Result<(BigUint, BigUint), SimulationError> {
+        let (reserve_in, reserve_out) = if sell_token < buy_token {
+            (&self.reserve_0, &self.reserve_1)
+        } else {
+            (&self.reserve_1, &self.reserve_0)
+        };
+        Ok((reserve_in / BigUint::from(2u64), reserve_out / BigUint::from(2u64)))
+    }
+
+    /// Returns the error of tycho's default `query_pool_swap`, so `ComponentDepthComputation` falls
+    /// back to tycho's generic swap query.
+    fn query_pool_swap(&self, _params: &QueryPoolSwapParams) -> Result<PoolSwap, SimulationError> {
+        Err(SimulationError::FatalError("query_pool_swap not implemented".into()))
+    }
+
+    fn delta_transition(
+        &mut self,
+        _delta: ProtocolStateDelta,
+        _tokens: &std::collections::HashMap<Bytes, Token>,
+        _balances: &Balances,
+    ) -> Result<(), TransitionError> {
+        unimplemented!("delta_transition not implemented in FeeConstantProductSim")
+    }
+
+    fn clone_box(&self) -> Box<dyn ProtocolSim> {
+        Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn eq(&self, other: &dyn ProtocolSim) -> bool {
+        other
+            .as_any()
+            .downcast_ref::<Self>()
+            .map(|o| {
+                o.reserve_0 == self.reserve_0 &&
+                    o.reserve_1 == self.reserve_1 &&
+                    o.fee_bps == self.fee_bps
+            })
+            .unwrap_or(false)
+    }
+}
+
 // ==================== Test Fixtures ====================
 
 /// Creates an address from a single byte (fills all 20 bytes with that value).
