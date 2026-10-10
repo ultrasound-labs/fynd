@@ -48,6 +48,25 @@ cargo's JSON output, so it is needed even with `--no-record`.
 **`samply`** only if you want flamegraphs: `cargo install samply`. The profiler runs without it
 using `--no-record`.
 
+## Measuring against the optimum, not against another algorithm
+
+Every bps figure here is measured against a baseline config, which answers "did this change
+help" and not "how much is left on the table". The `OPT` config answers the second one: it is the
+single-pair gas-aware optimum (`src/optimum.rs`), registered by the benchmark target rather than
+by `fynd-core`, because it is a reference and not a router.
+
+```bash
+./scripts/bench.sh --name shortfall --orders 200 --jobs 1 --timeout-ms 60000 --configs OPT,WF_d3
+```
+
+It enumerates every subset of the six best-paying direct pools for the order's pair, allocates
+each subset by bisecting a common marginal price through `SwapConstraint::PoolTargetPrice`, and
+prices each by the same `build_split_route` re-execution every other config's route goes through.
+Read its column as a ceiling for the splitting problem, with two caveats it cannot avoid: it is
+**direct pools only**, so a config that routes through another denomination or an intermediate
+token can legitimately beat it, and it considers only six pools, so a config using a seventh can
+edge it. Compare against it on orders where the config's own route stayed on the one pair.
+
 ## Running the benchmark
 
 ```bash

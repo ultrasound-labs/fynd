@@ -1,0 +1,2 @@
+algorithm = "gas_aware_optimum"
+max_hops = 2

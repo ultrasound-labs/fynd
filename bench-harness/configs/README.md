@@ -28,6 +28,7 @@ The stem is the algorithm's initials and the hop limit, and it is the label ever
 | `BF` | `bellman_ford` |
 | `ML` | `most_liquid` |
 | `PFW` | `path_frank_wolfe` |
+| `OPT` | `gas_aware_optimum` — not a router but the single-pair gas-aware optimum, registered by the benchmark target itself (see `src/optimum.rs`). Run it to read every other config's bps as a shortfall against the best net output available on that pair. Direct pools only, so an algorithm routing through another denomination can beat it; slow, so raise `--timeout-ms` |
 | `WF` | `water_fill` |
 
 `BF_d2.toml` is the baseline and is always included, listed or not.

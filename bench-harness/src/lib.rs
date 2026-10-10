@@ -21,6 +21,8 @@
 pub mod bench;
 pub mod derived;
 pub(crate) mod live;
+/// The single-pair gas-aware optimum, registered by the benchmark binaries as a reference.
+pub mod optimum;
 pub mod profile;
 pub(crate) mod trades;
 
