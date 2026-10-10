@@ -5,20 +5,67 @@ rather than over a set of pre-enumerated paths. Covers what was surveyed, what w
 measured, what turned out to be wrong with it, and what it measures now — so the dead ends are not
 walked twice, and so the two wrong diagnoses on the way here are not reached for a third time.
 
-Status as of 10 October 2026, second pass: **the first diagnosis was wrong, four real defects
-were fixed, and the benchmark says the algorithm is still not competitive.** Against the recorded
-Ethereum market it routes 50 of 200 orders where every shipped algorithm routes 193 or more,
-loses to Bellman-Ford on 23 of the 49 orders both answer, and has a p95 latency of 2.6 seconds
-against a 100 ms budget. The numbers are in [Measured results](#measured-results).
+## Verdict
 
-The diagnosis changed completely along the way, twice, and both turns are recorded below. The
-method is not wrong for the function ([the first pass's conclusion](#why-it-looked-like-the-method-superseded)),
-the coordinator had four specific defects ([the second pass's](#what-was-actually-wrong)) — and
-fixing all four, which converges synthetic networks of 130 tokens and 257 edges to a net-flow
-residual of 4e-9, moves the recorded market almost not at all: one solve in 39 reaches a usable
-flow. The one finding that does carry across is that
-[`spot_price` is not the derivative of `get_amount_out`](#the-derivative-was-never-the-derivative),
-which was the second of the three reasons the method was chosen.
+**Do not ship `convex_flow`, and do not replace the allocation step of anything that is
+shipped.** Measured against a true single-pair gas-aware optimum, built for this purpose and run
+over the recorded Ethereum market:
+
+| config | orders compared | mean shortfall | median | p90 | worst |
+|---|---|---|---|---|---|
+| **`WF_d3`** | 66 | **−0.00 bps** | 0.00 | 0.00 | 0.01 |
+| `ML_d3` | 68 | 0.01 bps | 0.00 | 0.00 | 0.36 |
+| `BF_d3` | 68 | 0.47 bps | 0.00 | 0.00 | 31.79 |
+| `PFW_d3` | 68 | 0.47 bps | 0.00 | 0.00 | 31.79 |
+| `CF_d2` | 44 | 20.79 bps | 0.00 | 43.32 | 261.94 |
+| `CF_d3` | 30 | 8.73 bps | 0.00 | 0.00 | 261.94 |
+
+Shortfall is net of gas, against the best net output obtainable on that pair with gas charged per
+pool used, restricted to orders where the optimum solved *and* the config's own route stayed on
+the one pair — so the comparison isolates allocation from everything else. `water_fill` is at the
+optimum: zero to two decimal places, a worst case of one hundredth of a basis point, and two
+orders where it edges the reference by using a pool outside the six the reference considers.
+
+So there is no allocation problem to solve here. The splitting step of the algorithm that wins
+today is already optimal to within a hundredth of a basis point of a gas-aware optimum, which
+independently reproduces the only published audit of the question — Xi and Moallemi measure a
+0.055 bps mean shortfall for allocation across 2.98 million swaps — on our own market, our own
+liquidity and our own gas price. Convex optimisation has nothing left to win in that step, and
+`convex_flow` is the only config that is materially off it.
+
+Three further things the reference measured, each worth more than the verdict on convex flow:
+
+- **The optimum splits across more than one pool on 8 of the 148 orders it solved.** On a dataset
+  of roughly thousand-dollar orders, charging gas per pool, the best thing to do is usually to use
+  one pool. Splitting is a large-order instrument and this dataset is not large orders.
+- **Every shipped algorithm beats the single-pair optimum, by up to 180 bps**, and the first
+  mechanism is not what one would guess: `BF_d2`'s two-leg answer on `WETH → USDC` is
+  `WETH → ETH` through the native wrapper and then `ETH → USDC`. The gain is reaching pools
+  denominated in another token, not splitting better. Which liquidity is *reachable* dominates
+  what is done with it, exactly as [ROUTING_ALGORITHMS.md](ROUTING_ALGORITHMS.md) found in the
+  literature.
+- **`convex_flow`'s subproblem is now exact and it changed nothing structural.** It asks the pool
+  for the flow that moves its marginal price to the dual's price ratio — one call, the protocol's
+  own math, the protocol's own fee convention — and the coordinator still reaches a primal
+  feasible point on 2 of 57 solves. What was wrong with the subproblem was worth fixing and was
+  never what was wrong with the method's fit here.
+
+## History of the diagnosis
+
+Three passes, two of them wrong, all recorded below so none is repeated.
+
+1. **The method is wrong for the function** — the dual is non-smooth, a spectral projected
+   gradient cannot descend it. [Superseded](#why-it-looked-like-the-method-superseded): the dual
+   is C¹ where it was believed to kink, and the paper's own solver is L-BFGS-B.
+2. **The coordinator has four defects** — point selection, subproblem resolution, a worthless
+   conserving flow, step scaling. [All four were real](#what-was-actually-wrong) and fixing them
+   converges synthetic networks of 130 tokens and 257 edges to a residual of 4e-9. The recorded
+   market moved from 26 solves in 200 to 73, still losing on every measure.
+3. **The oracle was wrong, and then the oracle was right and it still failed.**
+   `ProtocolSim::spot_price` is not the derivative of `get_amount_out`
+   ([the derivative was never the derivative](#the-derivative-was-never-the-derivative)), and
+   `SwapConstraint::PoolTargetPrice` answers the subproblem directly. Both corrected; see the
+   verdict above.
 
 The branch is `convex-routing`.
 
@@ -71,39 +118,47 @@ coordinator is implemented rather than pulled in.
 ## Measured results
 
 Deterministic runs (`--jobs 1`), recorded Ethereum fixture, `aggregator_trades_10k.json`, 200
-orders, every config at `max_hops = 3` except the `BF_d2` baseline the bench measures against.
-Bps are over the orders a config and the baseline both solved.
+orders, `--timeout-ms 60000` for the reference's benefit. Bps are against the `BF_d2` baseline the
+harness measures everything against, over the orders a config and the baseline both solved.
 
 | config | solved | mean bps | median bps | better | worse | tie | p50 | p95 |
 |---|---|---|---|---|---|---|---|---|
-| `BF_d2` (baseline) | 193/200 | — | — | — | — | — | 0.7ms | 2.0ms |
-| **`CF_d2`** | **50/200** | **−88.5** | +0.0 | **1** | **23** | 25 | 16.9ms | **2.56s** |
-| **`CF_d3`** | **30/200** | **−9.6** | +0.0 | **1** | **3** | 25 | 34.1ms | **0.82s** |
-| `WF_d3` | 198/200 | +147.4 | +0.0 | 69 | 0 | 124 | 9.5ms | 13.2ms |
-| `BF_d3` | 194/200 | +146.8 | +0.0 | 58 | 0 | 135 | 3.7ms | 7.8ms |
-| `ML_d3` | 198/200 | +146.3 | +0.0 | 59 | 0 | 134 | 1.8ms | 3.5ms |
-| `PFW_d3` | 194/200 | +146.8 | +0.0 | 58 | 0 | 135 | 4.5ms | 8.4ms |
+| `BF_d2` (baseline) | 193/200 | — | — | — | — | — | 0.7ms | 2.1ms |
+| `OPT` (reference) | 148/200 | −106.3 | +0.0 | 5 | 66 | 76 | 4.5ms | 77.1ms |
+| **`CF_d2`** | **73/200** | **−125.1** | −41.6 | 1 | 44 | 27 | 109ms | **2.75s** |
+| **`CF_d3`** | **31/200** | **−22.7** | +0.0 | 1 | 4 | 25 | 49ms | **0.86s** |
+| `WF_d3` | 198/200 | +147.4 | +0.0 | 69 | 0 | 124 | 9.5ms | 13.5ms |
+| `BF_d3` | 194/200 | +146.8 | +0.0 | 58 | 0 | 135 | 3.7ms | 7.9ms |
+| `ML_d3` | 198/200 | +146.3 | +0.0 | 59 | 0 | 134 | 1.8ms | 3.7ms |
+| `PFW_d3` | 194/200 | +146.8 | +0.0 | 58 | 0 | 135 | 4.6ms | 8.4ms |
 
-Three readings, in order of how much they matter.
+`OPT` is the single-pair gas-aware optimum (`bench-harness/src/optimum.rs`), not a router: it is
+direct-pool only, which is why it misses 52 orders and loses to the baseline on 66 — the baseline
+routes through other denominations and it cannot. Its purpose is the shortfall table in the
+[verdict](#verdict), which is the measurement this whole record was missing.
 
-**It does not answer.** A 15 to 25% solve rate against 97 to 99%. Every failure is the same one:
-the coordinator returns a flow that cannot be walked from `token_in` to `token_out`, and
-`decompose` hands back nothing.
+For convex flow the three readings are unchanged from the pass before, and no longer close:
 
-**Where it answers it does not win.** One order in fifty, across both configs, beats
-Bellman-Ford. Half the rest are ties — the same route, to the wei, which is the single-leg answer
-Bellman-Ford already had. An algorithm whose purpose is whole-network optimisation is mostly
-reproducing a shortest-path search, which is what the first pass saw as "61% of routes are a
-single leg".
+**It does not answer.** 15 to 37% against 97 to 99%. Every failure is the same one: the
+coordinator returns a flow that cannot be walked from `token_in` to `token_out`.
 
-**It does not fit the budget.** A p95 of 0.8 to 2.6 seconds against the 100 ms a quote has, and
-a p50 an order of magnitude above `water_fill`'s. The median solve is fine; the tail is where the
-networks are large, and that is also where whole-network optimisation is supposed to earn its
-keep.
+**Where it answers it does not win.** Two orders out of roughly a hundred compared, across both
+configs, beat Bellman-Ford. Most of the rest are ties — the same route, to the wei.
 
-For comparison, the same table before the second pass's fixes: `CF_d2` 26/200 at −251.9 bps,
-`CF_d3` 15/200 at −30.2. The fixes roughly doubled the solve rate and took most of the quality
-gap out, and left the conclusion where it was.
+**It does not fit the budget.** A p95 of 0.86 to 2.75 seconds against the 100 ms a quote has.
+
+The progression across the second and third passes, same 200 orders, `CF_d2`:
+
+| | solved | mean bps |
+|---|---|---|
+| as first written | 26/200 | −251.9 |
+| coordinator defects fixed | 50/200 | −88.5 |
+| subproblem asked of the pool | 73/200 | −125.1 |
+
+Each fix was correct and each raised the solve rate, and the quality moves with how much the
+coordinator is *trusted*: a correct subproblem makes an infeasible dual point propose flows
+confidently, `decompose` clamps them into a route, and the route is worse than not answering. The
+fixes made the parts right; the whole was never limited by the parts.
 
 ### Why the synthetic fixes barely moved it
 
@@ -359,6 +414,21 @@ marginal, but a fee applied to it in the wrong direction.
 correct convention, and four `convex_flow` tests use it. It was the right thing to add and it
 could not have found this on its own: a double written to the contract the algorithm needs
 cannot reveal that the market does not meet it.
+
+The fix in the end was not to correct the quoted price but to stop quoting. Two things in this
+codebase already had the answer, and both are now used:
+
+- **`SwapConstraint::PoolTargetPrice` is the subproblem.** "The swap required to move the pool's
+  marginal price down to a target" is the subproblem's own sentence. Around twenty protocols
+  implement `query_pool_swap`; Uniswap V2 inverts its reserve formula, V3 and V4 use the pool's
+  native `sqrt_price_limit` swap, and the rest fall back to tycho's generic search, which reports
+  its probes in `price_points` so the budget can be billed honestly. One call, the protocol's own
+  fee convention, and exactness where a tick makes the price discrete.
+  `ComponentDepthComputation` has been calling it every block the whole time.
+- **The fee-net marginal price is free.** `min(spot(in→out), 1/spot(out→in))` is `h⁺(0)` whether
+  a protocol marks the fee up or quotes it net, costs two lookups in a table the derived pass
+  refreshes every block, and needs no `ProtocolSim::fee` — which is `todo!()` for VM pools and
+  panics the worker. `ComponentDepthComputation::net_marginal_price` already did this.
 
 ## Q4, which the first pass left open
 

@@ -4,12 +4,20 @@ A survey of convex optimisation methods for order routing, written after
 [the convex flow attempt](ROUTING_RESEARCH.md) was benchmarked and lost. It asks one question:
 given what that benchmark measured, which method would do better, and by how much.
 
-The short answer is that the question is misdirected, and the literature has the number that
-says so. Across 2.98 million WETH–USDC swaps, Xi and Moallemi measure what optimal *allocation*
-is worth when the pool set is held fixed: **0.055 bps**. Over the same sample, losing a single
-block of pool state costs **1.3 to 1.8 bps**, and failing to activate the right pools is "the
-overwhelming driver of suboptimality". A better convex optimiser is chasing the smallest of the
-three terms, and the two larger ones are not optimisation problems.
+The short answer is that the question is misdirected, and there are now two independent numbers
+that say so — one from the literature and one from this market.
+
+Across 2.98 million WETH–USDC swaps, Xi and Moallemi measure what optimal *allocation* is worth
+when the pool set is held fixed: **0.055 bps**. Over the same sample, losing a single block of
+pool state costs **1.3 to 1.8 bps**, and failing to activate the right pools is "the overwhelming
+driver of suboptimality".
+
+Experiment 1 below has since been built and run. Against a single-pair gas-aware optimum over the
+recorded market, `water_fill`'s allocation is short by a **mean of −0.00 bps**, a worst case of
+**0.01 bps** over 66 like-for-like orders; `most_liquid` by 0.01 bps. The full table is in
+[ROUTING_RESEARCH.md](ROUTING_RESEARCH.md#verdict). The allocation step is not approximately
+optimal here, it is optimal, and a better convex optimiser is chasing the smallest of the three
+terms while the two larger ones are not optimisation problems.
 
 That does not make the methods below uninteresting — one of them is a clear improvement to the
 algorithm that wins today, for a reason that has nothing to do with allocation quality. It does
@@ -107,11 +115,11 @@ Three sources, none of them a drop-in:
 
 - **Xi and Moallemi's G-FVO benchmark** ([2607.20762](https://arxiv.org/abs/2607.20762)) is a
   bisection that selects pools accounting for discrete per-pool gas and finds the exact
-  maximum-output allocation. It is the reference definition of "gas-aware optimal" for a single
-  pair, and the right thing to measure fynd against. Building it as a *benchmark oracle* is
-  probably worth more than building it as an algorithm: it would tell us how much of the 2 bps
-  fynd leaves on the table, which no current measurement does — our bps figures are against
-  `BF_d2`, not against the optimum.
+  maximum-output allocation. Built, as the `OPT` config — and it answered its question against
+  expectation: the allocation it was meant to expose a gap in has no gap. What it did expose is
+  that the optimum uses one pool on 140 of 148 orders at this dataset's sizes, so gas-aware
+  *activation* on a single pair is mostly the trivial decision. The interesting activation
+  question is across pairs, which is the next two items.
 - **Escudero, Lara and Sama** ([2603.02844](https://arxiv.org/abs/2603.02844)) give the theory:
   gas as fixed activation costs makes a mixed-integer model, with a relaxation, a KKT system
   linking prices, fees and activation, and explicit bounds on the utility gap the relaxation
@@ -182,22 +190,29 @@ and in `CFMMRouter.jl`, and it is what converges linearly on 100 assets and 2,50
 
 Each one decides something. None takes more than a day.
 
-1. **Build the single-pair gas-aware optimum as a benchmark oracle** (Xi and Moallemi's G-FVO).
-   Every bps figure we have is against `BF_d2`. Without a true optimum we cannot tell whether
-   `water_fill`'s +147 bps is 2 bps short of perfect or 40. This changes what every later
-   experiment means and it is pure measurement — no routing code touched.
+1. ~~**Build the single-pair gas-aware optimum as a benchmark oracle**~~ — **done**, in
+   `bench-harness/src/optimum.rs`, registered as the `OPT` config. It enumerates every subset of
+   the six best-paying direct pools, allocates each by bisecting a common marginal price through
+   `PoolTargetPrice`, and prices each by the same re-execution every other config goes through.
+   Result: `water_fill` is at the optimum (−0.00 bps mean, 0.01 bps worst), the optimum splits
+   across more than one pool on 8 of 148 orders, and every shipped algorithm beats it by reaching
+   other denominations. Run it with `--configs OPT` and a raised `--timeout-ms`.
 2. **Count the price points a real swap crosses.** One pass over the recorded fixture calling
    `query_pool_swap` with `price_points`. Decides whether experiment 5 is worth anything, and
    tells us how non-smooth the real curves are, which is the open question left by the convex
    flow benchmark.
 3. **Raise `water_fill`'s candidate count and measure.** The literature says `k = 20`; we run
    four. If the curve of bps against `k` is still rising at 20, activation is where the headroom
-   is and the transfer algorithm's value is established without building it.
+   is and the transfer algorithm's value is established without building it. This is now the
+   **first** experiment to run: with allocation measured at the optimum, candidate coverage is
+   the only term left that fynd controls.
 4. **Put gas in the enumeration weight**, `-log π + γ·g`, instead of gating per path afterwards.
    Small, local to candidate discovery, and directly targets the dominant term.
 5. **Transfer algorithm as `water_fill`'s allocation step**, using `PoolTargetPrice` and the
    net marginal price. Measure simulation count at fixed candidate count, then spend the saving
-   on candidates.
+   on candidates. Note what experiment 1 did to the case for this: the allocation it would
+   replace is already optimal, so the only thing it can buy is the simulation budget, and that
+   case has to be made on the budget rather than on bps.
 
 ## References
 
