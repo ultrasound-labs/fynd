@@ -68,10 +68,12 @@ use tycho_simulation::{
 
 /// How many of the pair's pools the optimum is taken over.
 ///
-/// The subset search is `2^MAX_POOLS`, so this is the cost knob. Six keeps a solve inside a few
-/// thousand pool queries and matches the scale the literature's own audits work at — Xi and
-/// Moallemi evaluate four Uniswap pools.
-const MAX_POOLS: usize = 6;
+/// The subset search is `2^MAX_POOLS`, so this is the cost knob. Eight because six was not
+/// enough: on the wide scenario set `water_fill` beat the reference on 23 orders by splitting
+/// across more pools than it considered, and a reference something routinely beats is not one.
+/// The busiest pair in the recorded market is served by eleven pools, so this is still a cut —
+/// read the column as a ceiling over the eight best-paying pools, not over all of them.
+const MAX_POOLS: usize = 8;
 
 /// How many of the pair's pools are probed before the cut to [`MAX_POOLS`].
 ///
